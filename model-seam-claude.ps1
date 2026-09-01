@@ -17,6 +17,10 @@ The CLI runs as a child process with its output redirected to a file rather than
 piped, so the caller can animate progress through -OnWait while it works. Reading a
 file also sidesteps console code page decoding entirely.
 
+-Effort maps to the CLI's --effort, so the reasoning level is set explicitly rather
+than inherited from whatever the CLI defaults to; the callers record it in the run
+transcript header.
+
 Running totals land in $global:PodofoModelStats so a batch run can be costed.
 #>
 
@@ -51,6 +55,7 @@ function Invoke-ModelPrompt
         [scriptblock]$OnWait,
         [string]$RunLog,
         [string]$Model = 'claude-opus-5',
+        [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')][string]$Effort = 'high',
         [double]$MaxBudgetUsd = 2.0
     )
 
@@ -79,6 +84,7 @@ function Invoke-ModelPrompt
             '--output-format', 'stream-json'
             '--verbose'
             '--model', $Model
+            '--effort', $Effort
             '--restricted'
             '--disallowedTools', 'Edit', 'Write', 'NotebookEdit'
             '--max-budget-usd', $MaxBudgetUsd
@@ -135,8 +141,8 @@ function Invoke-ModelPrompt
         if (@($envelope.permission_denials).Count -gt 0)
             { Write-Warning "'$Label': $(@($envelope.permission_denials).Count) permission denial(s); the model was blocked from something it tried." }
 
-        Write-Verbose ("'{0}': {1} turn(s), {2:n4} USD, {3:n1}s" -f $Label, $envelope.num_turns,
-            $envelope.total_cost_usd, ($envelope.duration_ms / 1000))
+        Write-Verbose ("'{0}': {1}/{2}, {3} turn(s), {4:n4} USD, {5:n1}s" -f $Label, $Model, $Effort,
+            $envelope.num_turns, $envelope.total_cost_usd, ($envelope.duration_ms / 1000))
 
         # With a schema the constrained answer arrives already parsed; without one the
         # caller gets raw text and does its own parsing.

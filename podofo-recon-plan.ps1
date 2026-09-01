@@ -33,7 +33,8 @@ read access and schema-constrained output, not a plain completion:
             [Parameter(Mandatory)][string]$Prompt,
             [hashtable]$Schema,
             [string]$Label,
-            [string[]]$AllowDir
+            [string[]]$AllowDir,
+            [string]$Effort
         )
         # returns a PSCustomObject (or JSON string) matching $Schema
     }
@@ -45,6 +46,7 @@ param(
     [string]$DatabasePath,
     [string]$ScanRoot,
     [string]$ModelScript,
+    [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')][string]$Effort = 'high',
     [string]$Only,
     [switch]$Redo,
     [switch]$DryRun
@@ -201,8 +203,7 @@ function Show-Checklist
         [Parameter(Mandatory)][psobject]$Entries,
         [int]$CurrentIndex = -1,
         [Parameter(Mandatory)][datetime]$StartedAt,
-        [int]$AnalysedThisRun = 0,
-        [switch]$StopRequested
+        [int]$AnalysedThisRun = 0
     )
 
     $nameWidth = ($Entries | ForEach-Object { [System.IO.Path]::GetFileName($_.File.path).Length } | Measure-Object -Maximum).Maximum
@@ -239,10 +240,9 @@ function Show-Checklist
     $done = @($Entries | Where-Object { Test-FileDone -File $_.File }).Count
     $elapsed = (Get-Date) - $StartedAt
     $rate = if ($AnalysedThisRun -gt 0) { ' | {0:n0}s/file' -f ($elapsed.TotalSeconds / $AnalysedThisRun) } else { '' }
-    $hint = if ($StopRequested) { 'stopping after the current file' } else { "'q' stops after the current file" }
 
     try { Clear-Host } catch { }
-    Write-Host ('PoDoFo recon   {0}/{1} analysed   {2:hh\:mm\:ss} elapsed{3}   |   {4}' -f $done, $Entries.Count, $elapsed, $rate, $hint) -ForegroundColor $palette.Header
+    Write-Host ('PoDoFo recon   {0}/{1} analysed   {2:hh\:mm\:ss} elapsed{3}' -f $done, $Entries.Count, $elapsed, $rate) -ForegroundColor $palette.Header
 
     # The tier header can scroll out of the viewport, so keep it on the status line.
     if ($CurrentIndex -ge 0)
@@ -537,7 +537,7 @@ $interactive = Test-ConsoleInteractive
 $runHint = if ($null -eq (Get-MonitorProgram)) { "'q' stops after the current file" }
     else { "'q' stops after the current file, 'm' monitors this run" }
 
-Write-Host ("Analysing {0} pending file(s) of {1}." -f $pending.Count, $total)
+Write-Host ("Analysing {0} pending file(s) of {1} at effort '{2}'." -f $pending.Count, $total, $Effort)
 Write-StopHint -Interactive $interactive
 
 foreach ($entry in $pending)
@@ -567,11 +567,11 @@ foreach ($entry in $pending)
         {
             $prompt = New-ReconPrompt -Entry $entry -LineCount $lineCount -Index ($index + 1) -Total $total
             $transcript = Join-Path $runsRoot ('{0}.log' -f (Get-ScanFileKey $entry.File.path))
-            $transcriptState = Start-RunTranscript -Transcript $transcript -Header "recon | $($entry.File.path)"
+            $transcriptState = Start-RunTranscript -Transcript $transcript -Header "recon | $($entry.File.path) | effort: $Effort"
             $ticker = New-ActivityTicker -Color $palette.Current -Hint $runHint -Signal $keySignal `
                 -MonitorPath $transcript -RawLog $rawLog -Transcript $transcript -TranscriptState $transcriptState `
                 -Text ("Analysing {0} ({1} lines)..." -f [System.IO.Path]::GetFileName($entry.File.path), $lineCount)
-            $recon = Invoke-ModelPrompt -Prompt $prompt -Schema $reconSchema `
+            $recon = Invoke-ModelPrompt -Prompt $prompt -Schema $reconSchema -Effort $Effort `
                 -Label "recon:$($entry.File.path)" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
             Update-RunTranscript -RawLog $rawLog -Transcript $transcript -State $transcriptState
             if ($recon -is [string])
@@ -603,7 +603,7 @@ foreach ($entry in $pending)
 }
 
 if ($interactive)
-    { Show-Checklist -Entries $entries -StartedAt $startedAt -AnalysedThisRun $analysed -StopRequested:$stopRequested }
+    { Show-Checklist -Entries $entries -StartedAt $startedAt -AnalysedThisRun $analysed }
 
 Write-Host ''
 if ($stopRequested)

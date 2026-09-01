@@ -372,6 +372,10 @@ function New-ActivityTicker
     $monitorCommand = Get-Command Start-RunMonitor
     $transcriptCommand = Get-Command Update-RunTranscript
 
+    # Once 'q' is pressed only 'm' is still actionable, so the hint narrows to it.
+    $stopHint = if ((-not [string]::IsNullOrEmpty($MonitorPath)) -and ($null -ne (Get-MonitorProgram)))
+        { "press 'm' to monitor" } else { '' }
+
     $state = @{
         Row       = 0
         Frame     = 0
@@ -445,8 +449,9 @@ function New-ActivityTicker
             $state.Frame++
 
             $line = "  $spinner $body"
-            if (-not $stopping -and -not [string]::IsNullOrEmpty($Hint))
-                { $line += "   |   $Hint" }
+            $tail = if ($stopping) { $stopHint } else { $Hint }
+            if (-not [string]::IsNullOrEmpty($tail))
+                { $line += "   |   $tail" }
 
             if ($line.Length -gt $width)
                 { $line = $line.Substring(0, $width) }
