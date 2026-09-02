@@ -23,6 +23,12 @@ surface and proposes investigation targets. The database doubles as progress sta
 a file carries `done`, an optional `description` and a short `result`, and is saved
 after every file, so a stopped run resumes where it left off.
 
+An entry in `files` is either an object or a bare path string; the string means a
+pending, non-ignored file, and an entry that carries nothing else is written back as
+one. `"ignore": true` drops a file from the run - it is never analysed and never part
+of the count the run reports against, but it stays on the checklist marked `[-]`, so
+the decision stays visible rather than being lost by deleting the line.
+
 Full recon output goes to `scan/targets/<file-key>/recon.json`, where `<file-key>`
 is the path with `src/podofo/` stripped and `/` flattened to `-`.
 

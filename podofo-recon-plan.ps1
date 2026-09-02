@@ -11,6 +11,11 @@ result of its analysis. The database is saved after every file, so the pass resu
 where it left off. Full recon output goes to
 governance/security-audit/scan/targets/<file-key>/recon.json.
 
+A file entry may be written either as an object or as a bare path string, which means
+a pending, non-ignored file and is written back that way. Setting "ignore": true on
+an entry takes the file out of the run: it is never analysed and never counted, but
+it stays on the checklist, marked as ignored, so the decision stays visible.
+
 The model analyses one file per call and returns structured recon only. This script
 owns the database and renders the checklist.
 
@@ -94,11 +99,23 @@ function Read-Database
     if (@($db.tiers).Count -eq 0)
         { throw "No tiers in $DatabasePath" }
 
+    # A file may be written as a bare path string, which means exactly a pending,
+    # non-ignored entry. Everything downstream holds a live reference into the tier,
+    # so the expansion has to happen here, once, before Get-Entries reads it.
+    foreach ($tier in $db.tiers)
+    {
+        $tier.files = @(foreach ($file in $tier.files)
+        {
+            if ($file -is [string]) { [pscustomobject]@{ path = $file } } else { $file }
+        })
+    }
+
     return $db
 }
 
 # Absent means null, and absent "done" means false, so a field is written only when
-# it carries a value. A pending entry is just its path.
+# it carries a value. An entry that carries nothing but a path is written back as the
+# bare string it may have been typed as, which keeps a hand-edited list readable.
 function Save-Database
 {
     param([Parameter(Mandatory)][psobject]$Database)
@@ -108,6 +125,9 @@ function Save-Database
         $files = foreach ($file in $tier.files)
         {
             $entry = [ordered]@{ path = $file.path }
+            if (Test-FileIgnored -File $file)
+                { $entry.ignore = $true }
+
             if (Test-FileDone -File $file)
                 { $entry.done = $true }
 
@@ -118,7 +138,7 @@ function Save-Database
                     { $entry[$name] = $value }
             }
 
-            $entry
+            if ($entry.Count -eq 1) { $file.path } else { $entry }
         }
 
         [ordered]@{ tier = $tier.tier; description = $tier.description; files = @($files) }
@@ -134,6 +154,15 @@ function Test-FileDone
     param([Parameter(Mandatory)][psobject]$File)
 
     return [bool](Get-Field -Object $File -Name 'done')
+}
+
+# Absent means false. An ignored file is never analysed and never counted, but it
+# stays in the database and on the checklist so the decision remains visible.
+function Test-FileIgnored
+{
+    param([Parameter(Mandatory)][psobject]$File)
+
+    return [bool](Get-Field -Object $File -Name 'ignore')
 }
 
 # Flat iteration order over the tiers. Each row holds a live reference to the file
@@ -168,6 +197,8 @@ function Get-EntryStatusText
 
     if ($Current)
         { return 'analysing...' }
+    if (Test-FileIgnored -File $Entry.File)
+        { return 'ignored' }
     if (Test-FileDone -File $Entry.File)
         { return (Get-Field -Object $Entry.File -Name 'result') }
 
@@ -184,6 +215,8 @@ function Get-EntryColor
 
     if ($Current)
         { return $palette.Current }
+    if (Test-FileIgnored -File $Entry.File)
+        { return $palette.Muted }
     if (-not (Test-FileDone -File $Entry.File))
         { return $palette.Muted }
 
@@ -226,7 +259,10 @@ function Show-Checklist
         }
 
         $isCurrent = ($i -eq $CurrentIndex)
-        $mark = if ($isCurrent) { '>' } elseif (Test-FileDone -File $entry.File) { 'x' } else { ' ' }
+        $mark = if ($isCurrent) { '>' }
+            elseif (Test-FileIgnored -File $entry.File) { '-' }
+            elseif (Test-FileDone -File $entry.File) { 'x' }
+            else { ' ' }
         $text = '  [{0}] {1}  {2}' -f $mark,
             ([System.IO.Path]::GetFileName($entry.File.path).PadRight($nameWidth)),
             (Get-EntryStatusText -Entry $entry -Current:$isCurrent)
@@ -237,12 +273,16 @@ function Show-Checklist
         $rows.Add([pscustomobject]@{ Text = $text.TrimEnd(); Color = (Get-EntryColor -Entry $entry -Current:$isCurrent) })
     }
 
-    $done = @($Entries | Where-Object { Test-FileDone -File $_.File }).Count
+    # Ignored files are shown but not counted, so the ratio tracks the real work.
+    $active = @($Entries | Where-Object { -not (Test-FileIgnored -File $_.File) })
+    $done = @($active | Where-Object { Test-FileDone -File $_.File }).Count
+    $ignored = $Entries.Count - $active.Count
+    $skipped = if ($ignored -gt 0) { "   $ignored ignored" } else { '' }
     $elapsed = (Get-Date) - $StartedAt
     $rate = if ($AnalysedThisRun -gt 0) { ' | {0:n0}s/file' -f ($elapsed.TotalSeconds / $AnalysedThisRun) } else { '' }
 
     try { Clear-Host } catch { }
-    Write-Host ('PoDoFo recon   {0}/{1} analysed   {2:hh\:mm\:ss} elapsed{3}' -f $done, $Entries.Count, $elapsed, $rate) -ForegroundColor $palette.Header
+    Write-Host ('PoDoFo recon   {0}/{1} analysed{2}   {3:hh\:mm\:ss} elapsed{4}' -f $done, $active.Count, $skipped, $elapsed, $rate) -ForegroundColor $palette.Header
 
     # The tier header can scroll out of the viewport, so keep it on the status line.
     if ($CurrentIndex -ge 0)
@@ -504,9 +544,13 @@ function Format-ResultAnnotation
 
 $db = Read-Database
 $entries = Get-Entries -Database $db
-$total = $entries.Count
 
-$pending = @($entries | Where-Object { $Redo -or -not (Test-FileDone -File $_.File) })
+# Ignored files stay in $entries so the checklist still shows them, but they are not
+# work and they are not part of the total the run reports against.
+$active = @($entries | Where-Object { -not (Test-FileIgnored -File $_.File) })
+$total = $active.Count
+
+$pending = @($active | Where-Object { $Redo -or -not (Test-FileDone -File $_.File) })
 if (-not [string]::IsNullOrEmpty($Only))
     { $pending = @($pending | Where-Object { $_.File.path -match $Only }) }
 
@@ -566,7 +610,9 @@ foreach ($entry in $pending)
         }
         else
         {
-            $prompt = New-ReconPrompt -Entry $entry -LineCount $lineCount -Index ($index + 1) -Total $total
+            # Numbered against the files that are actually being analysed, so the
+            # prompt's "file n of m" matches what the run reports.
+            $prompt = New-ReconPrompt -Entry $entry -LineCount $lineCount -Index ([array]::IndexOf($active, $entry) + 1) -Total $total
             $transcript = Join-Path $runsRoot ('{0}.log' -f (Get-ScanFileKey $entry.File.path))
             $transcriptState = Start-RunTranscript -Transcript $transcript -Header "recon | $($entry.File.path)" -Effort $Effort
             $ticker = New-ActivityTicker -Color $palette.Current -Hint $runHint -Signal $keySignal `
