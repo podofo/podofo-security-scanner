@@ -53,6 +53,11 @@ the audit script adds `-Id`, `-MinPriority`, `-MaxTargets`, `-MaxSpendUsd` and
 `-SyncOnly`. Paths (`-RepoRoot`, `-ScanRoot`, `-DatabasePath`, `-ModelScript`) all
 default relative to the script.
 
+The activity display is two rows: the spinner and the current item, then a status
+row with subscription usage and the key hints, e.g.
+`usage week 13%, 5h 64%   |   'q' stops after the current file`. Usage is refreshed
+every 30 seconds.
+
 Press `q` to stop cleanly after the current item, or `m` to open the running model
 call's transcript in Notepad++ with `-monitor`. Creating `scan/STOP` has the same
 effect as `q` for non-interactive runs.
@@ -73,8 +78,17 @@ two phases cannot drift apart:
   NDJSON event stream into readable chat text, appended incrementally while the call
   is still running
 - `New-ActivityTicker` - the in-place spinner, and the only place keys pressed during
-  a model call are noticed. Rendering and key polling are gated separately, on output
-  and input redirection respectively
+  a model call are noticed. It owns two rows, and reserves the second by emitting a
+  line when it starts, which also absorbs the scroll when the cursor was on the last
+  row. Rendering and key polling are gated separately, on output and input
+  redirection respectively
+- `Get-UsageStatus` - the seven-day and five-hour subscription figures for the status
+  row. The CLI emits `rate_limit_event` records into the same stream the transcript
+  is built from, so they are read out of the run itself: no API query, no credential.
+  The last reading is cached in `$global:PodofoUsage` and rescanned at most every 30
+  seconds, so it survives between calls and across both phases
+- `Read-SharedLines` - reads the raw log with `FileShare.ReadWrite` while the child
+  still holds it open, returning `$null` instead of throwing on a momentary failure
 - `Get-AuditPalette`, `Write-Viewport`, `Test-ConsoleInteractive` - checklist
   rendering, with colours chosen to stay legible on a white terminal background
 

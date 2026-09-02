@@ -253,8 +253,9 @@ function Show-Checklist
 
     Write-Host ''
 
-    # Reserves the header, the tier line, the hint, a blank line and some slack.
-    Write-Viewport -Rows $rows -CurrentRow $currentRow -Reserved 7
+    # Reserves the header, the tier line, the two status rows, a blank line and
+    # some slack.
+    Write-Viewport -Rows $rows -CurrentRow $currentRow -Reserved 8
 }
 
 function Write-EntryResult

@@ -708,7 +708,8 @@ function Show-Queue
         { Write-Host ('  ' + $Queue[$CurrentIndex].origin_file) -ForegroundColor $palette.Group }
 
     Write-Host ''
-    Write-Viewport -Rows $rows -CurrentRow $currentRow -Reserved 7
+    # Reserves the header, the file line, the two status rows and some slack.
+    Write-Viewport -Rows $rows -CurrentRow $currentRow -Reserved 8
 }
 
 function Write-TargetResult

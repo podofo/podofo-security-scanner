@@ -260,21 +260,19 @@ function Format-RunEvent
 # Converts whatever is new in the raw stream into readable text and appends it. The
 # offset in $State makes this cheap to call every tick while the model is running,
 # which is what lets the transcript be monitored live.
-function Update-RunTranscript
+# The child process still holds the raw log open for writing, so it can only be read
+# with FileShare.ReadWrite. Returns $null rather than throwing when the file is
+# momentarily unreadable; every caller here is on a tick and will try again.
+function Read-SharedLines
 {
-    param(
-        [Parameter(Mandatory)][string]$RawLog,
-        [Parameter(Mandatory)][string]$Transcript,
-        [Parameter(Mandatory)][hashtable]$State
-    )
+    param([Parameter(Mandatory)][string]$Path)
 
-    if (-not (Test-Path $RawLog))
-        { return }
+    if (-not (Test-Path $Path))
+        { return $null }
 
     try
     {
-        # Shared read: the child still holds the file open for writing.
-        $stream = [System.IO.FileStream]::new($RawLog, [System.IO.FileMode]::Open,
+        $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open,
             [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         try
         {
@@ -282,6 +280,8 @@ function Update-RunTranscript
             $all = @()
             while ($null -ne ($line = $reader.ReadLine()))
                 { $all += $line }
+
+            return ,$all
         }
         finally
         {
@@ -290,8 +290,21 @@ function Update-RunTranscript
     }
     catch
     {
-        return
+        return $null
     }
+}
+
+function Update-RunTranscript
+{
+    param(
+        [Parameter(Mandatory)][string]$RawLog,
+        [Parameter(Mandatory)][string]$Transcript,
+        [Parameter(Mandatory)][hashtable]$State
+    )
+
+    $all = Read-SharedLines -Path $RawLog
+    if ($null -eq $all)
+        { return }
 
     if ($all.Count -le $State.Offset)
         { return }
@@ -350,6 +363,82 @@ function Start-RunTranscript
 
 #endregion
 
+#region Subscription usage
+
+# The CLI reports subscription usage as rate_limit_event records in the same stream
+# the transcript is built from, so the weekly figure is a by-product of the run
+# rather than a separate query: nothing has to be asked of the API, and no
+# credential is read. It only moves while a call is in flight, so the last reading is
+# kept globally and stays on screen across calls and across both phases.
+Set-Variable -Name PodofoUsage -Scope Global -Value @{
+    Text      = ''
+    CheckedAt = [datetime]::MinValue
+} -Force
+
+# Rescans the raw log at most every -IntervalSeconds and returns the cached string in
+# between, so this can be called on every spinner frame without re-reading the file.
+function Get-UsageStatus
+{
+    param([string]$RawLog, [int]$IntervalSeconds = 30)
+
+    $now = Get-Date
+    if (($now - $global:PodofoUsage.CheckedAt).TotalSeconds -lt $IntervalSeconds)
+        { return $global:PodofoUsage.Text }
+
+    $global:PodofoUsage.CheckedAt = $now
+    if ([string]::IsNullOrEmpty($RawLog))
+        { return $global:PodofoUsage.Text }
+
+    $all = Read-SharedLines -Path $RawLog
+    if ($null -eq $all)
+        { return $global:PodofoUsage.Text }
+
+    # Only the newest reading matters, so scan backwards and stop at the first one
+    # that parses; a torn trailing line is skipped rather than retried.
+    for ($i = $all.Count - 1; $i -ge 0; $i--)
+    {
+        if ($all[$i] -notmatch '"rate_limit_event"')
+            { continue }
+
+        try
+            { $record = $all[$i] | ConvertFrom-Json }
+        catch
+            { continue }
+
+        $info = Get-Field -Object $record -Name 'rate_limit_info'
+        if ($null -eq $info)
+            { continue }
+
+        $windows = Get-Field -Object $info -Name 'unifiedWindows'
+        if ($null -eq $windows)
+            { continue }
+
+        $parts = @()
+        foreach ($window in @(@{ Name = 'seven_day'; Label = 'week' }, @{ Name = 'five_hour'; Label = '5h' }))
+        {
+            $bucket = Get-Field -Object $windows -Name $window.Name
+            if ($null -eq $bucket)
+                { continue }
+
+            $used = Get-Field -Object $bucket -Name 'utilization'
+            if ($null -eq $used)
+                { continue }
+
+            $parts += '{0} {1}%' -f $window.Label, [int][Math]::Round(100 * [double]$used)
+        }
+
+        if ($parts.Count -eq 0)
+            { continue }
+
+        $global:PodofoUsage.Text = 'Usage ' + ($parts -join ', ')
+        break
+    }
+
+    return $global:PodofoUsage.Text
+}
+
+#endregion
+
 #region Activity line
 
 # A one-line activity indicator that rewrites itself in place, and the place where
@@ -378,6 +467,7 @@ function New-ActivityTicker
     # resolve. Capturing the command objects as variables makes them travel with it.
     $monitorCommand = Get-Command Start-RunMonitor
     $transcriptCommand = Get-Command Update-RunTranscript
+    $usageCommand = Get-Command Get-UsageStatus
 
     # Once 'q' is pressed only 'm' is still actionable, so the hint narrows to it.
     $stopHint = if ((-not [string]::IsNullOrEmpty($MonitorPath)) -and ($null -ne (Get-MonitorProgram)))
@@ -395,7 +485,13 @@ function New-ActivityTicker
     {
         $state.CanRender = -not [Console]::IsOutputRedirected
         if ($state.CanRender)
-            { $state.Row = [Console]::CursorTop }
+        {
+            # The status is two rows. Emitting one line now reserves the second and,
+            # when the cursor was already on the last row, absorbs the scroll that
+            # would otherwise leave $state.Row pointing one line too low.
+            Write-Host ''
+            $state.Row = [Math]::Max(0, [Console]::CursorTop - 1)
+        }
     }
     catch
     {
@@ -456,15 +552,29 @@ function New-ActivityTicker
             $state.Frame++
 
             $line = "  $spinner $body"
-            $tail = if ($stopping) { $stopHint } else { $Hint }
-            if (-not [string]::IsNullOrEmpty($tail))
-                { $line += "   |   $tail" }
-
             if ($line.Length -gt $width)
                 { $line = $line.Substring(0, $width) }
 
+            # Second row: what the run is costing and what can be pressed, indented
+            # under the activity text. Get-UsageStatus throttles itself, so this
+            # costs a cached string on all but one frame in thirty seconds.
+            $segments = @()
+            $usage = & $usageCommand -RawLog $RawLog
+            if (-not [string]::IsNullOrEmpty($usage))
+                { $segments += $usage }
+
+            $tail = if ($stopping) { $stopHint } else { $Hint }
+            if (-not [string]::IsNullOrEmpty($tail))
+                { $segments += $tail }
+
+            $status = if ($segments.Count -gt 0) { '    ' + ($segments -join '   |   ') } else { '' }
+            if ($status.Length -gt $width)
+                { $status = $status.Substring(0, $width) }
+
             [Console]::SetCursorPosition(0, $state.Row)
             Write-Host $line.PadRight($width) -ForegroundColor $shade -NoNewline
+            [Console]::SetCursorPosition(0, $state.Row + 1)
+            Write-Host $status.PadRight($width) -ForegroundColor $palette.Muted -NoNewline
             [Console]::SetCursorPosition(0, $state.Row)
         }
         catch
