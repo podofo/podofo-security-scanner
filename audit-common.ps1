@@ -189,7 +189,7 @@ function Format-ToolResult
 # reading (rate limit notices, bookkeeping) yields nothing.
 function Format-RunEvent
 {
-    param([Parameter(Mandatory)][psobject]$Record, [hashtable]$ToolNames)
+    param([Parameter(Mandatory)][psobject]$Record, [hashtable]$ToolNames, [string]$Effort)
 
     switch ($Record.type)
     {
@@ -198,7 +198,13 @@ function Format-RunEvent
             if ($Record.subtype -ne 'init')
                 { return @() }
 
-            return @("model $($Record.model)", "session $($Record.session_id)", '')
+            # The init event carries the model but not the reasoning level, so the
+            # effort the caller asked for is threaded in through the transcript state.
+            $model = "model $($Record.model)"
+            if (-not [string]::IsNullOrEmpty($Effort))
+                { $model += " | effort $Effort" }
+
+            return @($model, "session $($Record.session_id)", '')
         }
 
         'assistant'
@@ -297,7 +303,7 @@ function Update-RunTranscript
             { continue }
 
         try
-            { $new += Format-RunEvent -Record ($all[$i] | ConvertFrom-Json) -ToolNames $State.ToolNames }
+            { $new += Format-RunEvent -Record ($all[$i] | ConvertFrom-Json) -ToolNames $State.ToolNames -Effort $State.Effort }
         catch
             { }   # A half-written trailing line; it will be picked up next tick.
     }
@@ -330,7 +336,8 @@ function Start-RunTranscript
 {
     param(
         [Parameter(Mandatory)][string]$Transcript,
-        [Parameter(Mandatory)][string]$Header
+        [Parameter(Mandatory)][string]$Header,
+        [string]$Effort = ''
     )
 
     $directory = Split-Path -Parent $Transcript
@@ -338,7 +345,7 @@ function Start-RunTranscript
         { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
 
     Set-Content -LiteralPath $Transcript -Value @("=== $Header ===", '') -Encoding utf8
-    return @{ Offset = 0; ToolNames = @{} }
+    return @{ Offset = 0; ToolNames = @{}; Effort = $Effort }
 }
 
 #endregion

@@ -866,7 +866,7 @@ foreach ($target in $work)
         { Show-Queue -Queue $queue -CurrentIndex $index -Activity 'auditing...' -StartedAt $startedAt -DoneThisRun $doneThisRun }
 
     $auditTranscript = Join-Path $runsRoot "$($target.id)-audit.log"
-    $auditState = Start-RunTranscript -Transcript $auditTranscript -Header "audit | #$($target.seq) $($target.id) | $($target.origin_file) | effort: $Effort"
+    $auditState = Start-RunTranscript -Transcript $auditTranscript -Header "audit | #$($target.seq) $($target.id) | $($target.origin_file)" -Effort $Effort
     $ticker = New-ActivityTicker -Color $palette.Current -Hint $runHint -Signal $keySignal `
         -MonitorPath $auditTranscript -RawLog $rawLog -Transcript $auditTranscript -TranscriptState $auditState `
         -Text ("Auditing #{0} {1} in {2}..." -f $target.seq, $target.id, [System.IO.Path]::GetFileName($target.origin_file))
@@ -885,7 +885,7 @@ foreach ($target in $work)
 
     # A separate process, so the validator cannot see the auditor's reasoning.
     $validateTranscript = Join-Path $runsRoot "$($target.id)-validate.log"
-    $validateState = Start-RunTranscript -Transcript $validateTranscript -Header "validate | #$($target.seq) $($target.id) | $($target.origin_file) | effort: $Effort"
+    $validateState = Start-RunTranscript -Transcript $validateTranscript -Header "validate | #$($target.seq) $($target.id) | $($target.origin_file)" -Effort $Effort
     $ticker = New-ActivityTicker -Color $palette.Current -Hint $runHint -Signal $keySignal `
         -MonitorPath $validateTranscript -RawLog $rawLog -Transcript $validateTranscript -TranscriptState $validateState `
         -Text ("Validating #{0} {1} in {2}..." -f $target.seq, $target.id, [System.IO.Path]::GetFileName($target.origin_file))

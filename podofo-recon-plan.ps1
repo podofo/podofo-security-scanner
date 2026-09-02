@@ -567,7 +567,7 @@ foreach ($entry in $pending)
         {
             $prompt = New-ReconPrompt -Entry $entry -LineCount $lineCount -Index ($index + 1) -Total $total
             $transcript = Join-Path $runsRoot ('{0}.log' -f (Get-ScanFileKey $entry.File.path))
-            $transcriptState = Start-RunTranscript -Transcript $transcript -Header "recon | $($entry.File.path) | effort: $Effort"
+            $transcriptState = Start-RunTranscript -Transcript $transcript -Header "recon | $($entry.File.path)" -Effort $Effort
             $ticker = New-ActivityTicker -Color $palette.Current -Hint $runHint -Signal $keySignal `
                 -MonitorPath $transcript -RawLog $rawLog -Transcript $transcript -TranscriptState $transcriptState `
                 -Text ("Analysing {0} ({1} lines)..." -f [System.IO.Path]::GetFileName($entry.File.path), $lineCount)
