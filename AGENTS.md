@@ -54,7 +54,7 @@ report lookup globs `*<id>.md` so renames clean up after themselves.
 
 ### Running them
 
-Both take `-Effort` (`low` to `max`, default `high`), `-Only`, `-Redo` and `-DryRun`;
+Both take `-Effort` (`low` to `max`, default `xhigh`), `-Only`, `-Redo` and `-DryRun`;
 the audit script adds `-Id`, `-MinPriority`, `-MaxTargets`, `-MaxSpendUsd` and
 `-SyncOnly`. Paths (`-RepoRoot`, `-ScanRoot`, `-DatabasePath`, `-ModelScript`) all
 default relative to the script.

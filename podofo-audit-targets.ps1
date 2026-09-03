@@ -38,7 +38,7 @@ param(
     [string]$DatabasePath,
     [string]$ScanRoot,
     [string]$ModelScript,
-    [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')][string]$Effort = 'high',
+    [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')][string]$Effort = 'xhigh',
     [string]$Only,
     [string]$Id,
     [ValidateSet('high', 'medium', 'low')][string]$MinPriority,
