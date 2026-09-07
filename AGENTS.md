@@ -61,8 +61,9 @@ default relative to the script.
 
 The activity display is two rows: the spinner and the current item, then a status
 row with subscription usage and the key hints, e.g.
-`usage week 13%, 5h 64%   |   'q' stops after the current file`. Usage is refreshed
-every 30 seconds.
+`usage week 13%, 5h 64%   |   'q' stops after the current file`. Usage is on screen
+from the first frame, seeded from the previous run's log, and is re-read after every
+call and at most every 30 seconds within one.
 
 Press `q` to stop cleanly after the current item, or `m` to open the running model
 call's transcript in Notepad++ with `-monitor`. Creating `scan/STOP` has the same
@@ -89,11 +90,16 @@ two phases cannot drift apart:
   line when it starts, which also absorbs the scroll when the cursor was on the last
   row. Rendering and key polling are gated separately, on output and input
   redirection respectively
-- `Get-UsageStatus` - the seven-day and five-hour subscription figures for the status
-  row. The CLI emits `rate_limit_event` records into the same stream the transcript
-  is built from, so they are read out of the run itself: no API query, no credential.
-  The last reading is cached in `$global:PodofoUsage` and rescanned at most every 30
-  seconds, so it survives between calls and across both phases
+- `Get-UsageStatus`, `Update-UsageStatus` - the seven-day and five-hour subscription
+  figures for the status row. The CLI emits `rate_limit_event` records into the same
+  stream the transcript is built from, so they are read out of the run itself: no API
+  query, no credential. The last reading is cached in `$global:PodofoUsage` and
+  rescanned at most every 30 seconds, so it survives between calls and across both
+  phases. A call's log carries no reading until its first response comes back, so
+  the drivers force a read through `Update-UsageStatus` before the run starts, off
+  the previous run's log, and again after each call; while the cache is still empty
+  the interval drops to 3 seconds, because booking the full 30 on a miss left the
+  row blank long after the figures had arrived
 - `Get-RateLimitBlock`, `Format-RateLimitBlock`, `Test-RateLimitError` - the same
   `rate_limit_event` channel reports a drained window, with `status` `rejected`,
   the window that ran out in `rateLimitType` and its `resetsAt` in Unix seconds.

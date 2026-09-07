@@ -586,6 +586,11 @@ $runHint = if ($null -eq (Get-MonitorProgram)) { "'q' stops after the current fi
 Write-Host ("Analysing {0} pending file(s) of {1} at effort '{2}'." -f $pending.Count, $total, $Effort)
 Write-StopHint -Interactive $interactive
 
+# The status row would otherwise open blank: the log a call writes has no usage
+# reading in it until the first response comes back. The previous run's log is still
+# on disk at this point, and its closing figures are a better opening than nothing.
+Update-UsageStatus -RawLog $rawLog
+
 foreach ($entry in $pending)
 {
     $stopRequested = Update-StopRequest -Current $stopRequested
@@ -638,6 +643,11 @@ foreach ($entry in $pending)
             }
 
             Update-RunTranscript -RawLog $rawLog -Transcript $transcript -State $transcriptState
+
+            # The log has just gained this call's closing figures, so the next file
+            # starts its status row current rather than a cache interval behind.
+            Update-UsageStatus -RawLog $rawLog
+
             if ($recon -is [string])
             {
                 $text = $recon.Trim()

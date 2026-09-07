@@ -849,6 +849,11 @@ $runHint = if ($null -eq (Get-MonitorProgram)) { "'q' stops after the current ta
 Write-Host ("Working {0} target(s) of {1} at effort '{2}'." -f $work.Count, @($db.targets).Count, $Effort)
 Write-StopHint -Interactive $interactive
 
+# The status row would otherwise open blank: the log a call writes has no usage
+# reading in it until the first response comes back. The previous run's log is still
+# on disk at this point, and its closing figures are a better opening than nothing.
+Update-UsageStatus -RawLog $rawLog
+
 foreach ($target in $work)
 {
     $stopRequested = Update-StopRequest -Current $stopRequested
@@ -894,6 +899,10 @@ foreach ($target in $work)
 
     Update-RunTranscript -RawLog $rawLog -Transcript $auditTranscript -State $auditState
 
+    # The log has just gained this call's closing figures, so validation starts its
+    # status row current rather than a cache interval behind.
+    Update-UsageStatus -RawLog $rawLog
+
     $reportPath = Write-Report -Target $target -Audit $audit
     Set-Field -Object $target -Name 'state' -Value 'audited'
     Set-Field -Object $target -Name 'report' -Value $reportPath
@@ -927,6 +936,7 @@ foreach ($target in $work)
     }
 
     Update-RunTranscript -RawLog $rawLog -Transcript $validateTranscript -State $validateState
+    Update-UsageStatus -RawLog $rawLog
 
     # Validation renames the report, so the recorded path has to be refreshed.
     $reportPath = Write-Report -Target $target -Audit $audit -Validation $validation

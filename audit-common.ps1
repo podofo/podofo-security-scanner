@@ -379,10 +379,16 @@ Set-Variable -Name PodofoUsage -Scope Global -Value @{
 # between, so this can be called on every spinner frame without re-reading the file.
 function Get-UsageStatus
 {
-    param([string]$RawLog, [int]$IntervalSeconds = 30)
+    param([string]$RawLog, [int]$IntervalSeconds = 30, [switch]$Force)
+
+    # A blank row is worth more effort than a stale one. A call's log starts empty
+    # and only gains a reading once the first response comes back, so booking the
+    # full interval on a miss left the row empty long after the figures had arrived.
+    if ([string]::IsNullOrEmpty($global:PodofoUsage.Text))
+        { $IntervalSeconds = 3 }
 
     $now = Get-Date
-    if (($now - $global:PodofoUsage.CheckedAt).TotalSeconds -lt $IntervalSeconds)
+    if ((-not $Force) -and (($now - $global:PodofoUsage.CheckedAt).TotalSeconds -lt $IntervalSeconds))
         { return $global:PodofoUsage.Text }
 
     $global:PodofoUsage.CheckedAt = $now
@@ -435,6 +441,17 @@ function Get-UsageStatus
     }
 
     return $global:PodofoUsage.Text
+}
+
+# Reads now rather than waiting out the interval. Called once before a run starts,
+# where the previous run's log is still on disk and its last figures are a better
+# opening than an empty row, and again after each model call, where the log has just
+# gained that call's closing figures. Returns nothing; the ticker reads the cache.
+function Update-UsageStatus
+{
+    param([string]$RawLog)
+
+    $null = Get-UsageStatus -RawLog $RawLog -Force
 }
 
 # An exhausted subscription window arrives on the same channel as the usage figures:
