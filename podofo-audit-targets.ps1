@@ -806,7 +806,9 @@ if ($SyncOnly)
     return
 }
 
-$queue = Get-QueueOrder -Targets @($db.targets)
+# Wrapped: a single-target database unrolls to a bare object, and the [array]
+# lookups the display does need an array either way.
+$queue = @(Get-QueueOrder -Targets @($db.targets))
 $work = @($queue | Where-Object { $Redo -or (Test-TargetPending -Target $_) })
 if (-not [string]::IsNullOrEmpty($Only))
     { $work = @($work | Where-Object { $_.origin_file -match $Only }) }
@@ -837,6 +839,7 @@ if (Test-Path $stopFile)
 $startedAt = Get-Date
 $doneThisRun = 0
 $stopRequested = $false
+$limitMessage = ''
 $interactive = Test-ConsoleInteractive
 
 # 'm' is only worth offering when something can actually tail the run log.
@@ -871,8 +874,24 @@ foreach ($target in $work)
     $ticker = New-ActivityTicker -Color $palette.Current -Hint $runHint -Signal $keySignal `
         -MonitorPath $auditTranscript -RawLog $rawLog -Transcript $auditTranscript -TranscriptState $auditState `
         -Text ("Auditing #{0} {1} in {2}..." -f $target.seq, $target.id, [System.IO.Path]::GetFileName($target.origin_file))
-    $audit = Invoke-ModelPrompt -Prompt (New-AuditPrompt -Target $target -Database $db) `
-        -Schema $auditSchema -Effort $Effort -Label "audit:$label" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+    try
+    {
+        $audit = Invoke-ModelPrompt -Prompt (New-AuditPrompt -Target $target -Database $db) `
+            -Schema $auditSchema -Effort $Effort -Label "audit:$label" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+    }
+    catch
+    {
+        # A drained subscription window is a pause, not a failure. The target keeps
+        # the state it had, so a run started after the reset takes it from here;
+        # anything else is a real error and stands.
+        if (-not (Test-RateLimitError -ErrorRecord $_))
+            { throw }
+
+        Update-RunTranscript -RawLog $rawLog -Transcript $auditTranscript -State $auditState
+        $limitMessage = $_.Exception.Message
+        break
+    }
+
     Update-RunTranscript -RawLog $rawLog -Transcript $auditTranscript -State $auditState
 
     $reportPath = Write-Report -Target $target -Audit $audit
@@ -890,8 +909,23 @@ foreach ($target in $work)
     $ticker = New-ActivityTicker -Color $palette.Current -Hint $runHint -Signal $keySignal `
         -MonitorPath $validateTranscript -RawLog $rawLog -Transcript $validateTranscript -TranscriptState $validateState `
         -Text ("Validating #{0} {1} in {2}..." -f $target.seq, $target.id, [System.IO.Path]::GetFileName($target.origin_file))
-    $validation = Invoke-ModelPrompt -Prompt (New-ValidatePrompt -Target $target -Database $db -ReportPath $reportPath) `
-        -Schema $validateSchema -Effort $Effort -Label "validate:$label" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+    try
+    {
+        $validation = Invoke-ModelPrompt -Prompt (New-ValidatePrompt -Target $target -Database $db -ReportPath $reportPath) `
+            -Schema $validateSchema -Effort $Effort -Label "validate:$label" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+    }
+    catch
+    {
+        # The target is already saved as 'audited', which still counts as pending, so
+        # it is re-audited and validated in one piece after the reset.
+        if (-not (Test-RateLimitError -ErrorRecord $_))
+            { throw }
+
+        Update-RunTranscript -RawLog $rawLog -Transcript $validateTranscript -State $validateState
+        $limitMessage = $_.Exception.Message
+        break
+    }
+
     Update-RunTranscript -RawLog $rawLog -Transcript $validateTranscript -State $validateState
 
     # Validation renames the report, so the recorded path has to be refreshed.
@@ -949,7 +983,12 @@ if ($interactive)
 Write-Host ''
 $total = Get-ModelSpend
 $spent = if ($null -ne $total) { ' {0:n2} USD spent.' -f $total } else { '' }
-if ($stopRequested)
+if (-not [string]::IsNullOrEmpty($limitMessage))
+{
+    Write-Host "  $limitMessage" -ForegroundColor $palette.Warning
+    Write-Host "Stopped on the subscription limit. $doneThisRun target(s) completed this run.$spent Re-run after the reset to continue." -ForegroundColor $palette.Warning
+}
+elseif ($stopRequested)
     { Write-Host "Stopped early. $doneThisRun target(s) completed this run.$spent" -ForegroundColor $palette.Warning }
 else
     { Write-Host "Pass complete. $doneThisRun target(s) completed this run.$spent" -ForegroundColor $palette.Success }

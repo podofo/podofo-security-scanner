@@ -66,7 +66,8 @@ every 30 seconds.
 
 Press `q` to stop cleanly after the current item, or `m` to open the running model
 call's transcript in Notepad++ with `-monitor`. Creating `scan/STOP` has the same
-effect as `q` for non-interactive runs.
+effect as `q` for non-interactive runs. Running out of subscription quota stops a run
+the same way, reporting which window ran out and when it resets.
 
 ## Common infrastructure
 
@@ -93,6 +94,16 @@ two phases cannot drift apart:
   is built from, so they are read out of the run itself: no API query, no credential.
   The last reading is cached in `$global:PodofoUsage` and rescanned at most every 30
   seconds, so it survives between calls and across both phases
+- `Get-RateLimitBlock`, `Format-RateLimitBlock`, `Test-RateLimitError` - the same
+  `rate_limit_event` channel reports a drained window, with `status` `rejected`,
+  the window that ran out in `rateLimitType` and its `resetsAt` in Unix seconds.
+  These read that event and turn it into the sentence a stopped run prints, naming
+  the window only when the source was explicit about it: guessing "weekly" at a
+  five-hour pause would send someone away for days. A refusal that arrives before
+  the session has reported any usage carries no such event, so the provider's own
+  notice ("resets 4:50pm (Europe/Rome)") is parsed as a second source, against a
+  fixed list of formats - a loose `TryParse` accepts those strings and answers with
+  something unrelated
 - `Read-SharedLines` - reads the raw log with `FileShare.ReadWrite` while the child
   still holds it open, returning `$null` instead of throwing on a momentary failure
 - `Get-AuditPalette`, `Write-Viewport`, `Test-ConsoleInteractive` - checklist
@@ -113,9 +124,19 @@ The CLI runs as a child process with output redirected to a file rather than pip
 so the caller can animate progress through `-OnWait` and the log is watchable while
 the call is in flight. Running totals accumulate in `$global:PodofoModelStats`.
 
+A drained subscription window is not a failed call: it comes back as a 429 with the
+limit notice in place of the answer, and the CLI still exits 1. So the result
+envelope is read and classified before the exit code is judged - the other way round
+buries the reason under a bare `claude exited 1` - and stderr is checked too, for a
+refusal that lands before anything is streamed. The seam raises it with the error id
+`PodofoRateLimitReached`, its message naming the window and when it reopens. Both
+drivers catch that one id, print it, and stop after the item they were on, leaving it
+pending; every other error still ends the run loudly.
+
 Swapping in another provider means replacing only this file
 (`-ModelScript <path>`); the contract is `-Prompt -Schema -Label -AllowDir -OnWait
--RunLog -Model -Effort -MaxBudgetUsd`.
+-RunLog -Model -Effort -MaxBudgetUsd`, and raising `PodofoRateLimitReached` for an
+exhausted quota if it wants the same clean stop.
 
 Note: the CLI returns thinking blocks with the text stripped (only the encrypted
 signature survives), so run transcripts cannot include model reasoning.

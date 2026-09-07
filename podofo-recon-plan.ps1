@@ -576,6 +576,7 @@ if (Test-Path $stopFile)
 $startedAt = Get-Date
 $analysed = 0
 $stopRequested = $false
+$limitMessage = ''
 $interactive = Test-ConsoleInteractive
 
 # 'm' is only worth offering when something can actually tail the run log.
@@ -618,8 +619,24 @@ foreach ($entry in $pending)
             $ticker = New-ActivityTicker -Color $palette.Current -Hint $runHint -Signal $keySignal `
                 -MonitorPath $transcript -RawLog $rawLog -Transcript $transcript -TranscriptState $transcriptState `
                 -Text ("Analysing {0} ({1} lines)..." -f [System.IO.Path]::GetFileName($entry.File.path), $lineCount)
-            $recon = Invoke-ModelPrompt -Prompt $prompt -Schema $reconSchema -Effort $Effort `
-                -Label "recon:$($entry.File.path)" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+            try
+            {
+                $recon = Invoke-ModelPrompt -Prompt $prompt -Schema $reconSchema -Effort $Effort `
+                    -Label "recon:$($entry.File.path)" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+            }
+            catch
+            {
+                # A drained subscription window is a pause, not a failure. The file
+                # is left pending and untouched, so a run started after the reset
+                # picks it up again here; anything else is a real error and stands.
+                if (-not (Test-RateLimitError -ErrorRecord $_))
+                    { throw }
+
+                Update-RunTranscript -RawLog $rawLog -Transcript $transcript -State $transcriptState
+                $limitMessage = $_.Exception.Message
+                break
+            }
+
             Update-RunTranscript -RawLog $rawLog -Transcript $transcript -State $transcriptState
             if ($recon -is [string])
             {
@@ -653,7 +670,12 @@ if ($interactive)
     { Show-Checklist -Entries $entries -StartedAt $startedAt -AnalysedThisRun $analysed }
 
 Write-Host ''
-if ($stopRequested)
+if (-not [string]::IsNullOrEmpty($limitMessage))
+{
+    Write-Host "  $limitMessage" -ForegroundColor $palette.Warning
+    Write-Host "Stopped on the subscription limit. $analysed file(s) analysed this run. Re-run after the reset to continue." -ForegroundColor $palette.Warning
+}
+elseif ($stopRequested)
     { Write-Host "Stopped early. $analysed file(s) analysed this run. Re-run to continue." -ForegroundColor $palette.Warning }
 else
     { Write-Host "Pass complete. $analysed file(s) analysed this run." -ForegroundColor $palette.Success }

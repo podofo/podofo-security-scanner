@@ -22,6 +22,12 @@ than inherited from whatever the CLI defaults to; the callers record it in the r
 transcript header.
 
 Running totals land in $global:PodofoModelStats so a batch run can be costed.
+
+A drained subscription window (five-hour or weekly) is told apart from a real
+failure - it reaches the caller as a 429 in the result envelope, whatever the exit
+code - and raised with the error id PodofoRateLimitReached, carrying the window and
+its reset time in the message. Test-RateLimitError recognises it on the caller's
+side; a replacement seam has to raise the same id to get the same clean stop.
 #>
 
 Set-Variable -Name PodofoModelStats -Scope Global -Value ([pscustomobject]@{
@@ -43,6 +49,47 @@ function ConvertTo-ProcessArgument
     # A trailing backslash would otherwise escape the closing quote.
     $escaped = $escaped -replace '(\\+)$', '$1$1'
     return '"' + $escaped + '"'
+}
+
+# A drained subscription window is reported in the result envelope as a 429 with the
+# limit notice in place of the answer; the CLI exits non-zero for it, so the envelope
+# and not the exit code is what tells a pause apart from a broken call. Returns the
+# notice text, or $null when the failure is something else.
+function Get-RateLimitNotice
+{
+    param([psobject]$Envelope, [string]$Stderr)
+
+    # StrictMode throws on an absent property, so the fields come off the property
+    # bag; api_error_status only appears on an API failure.
+    if ($null -ne $Envelope)
+    {
+        $status = $Envelope.PSObject.Properties['api_error_status']
+        $result = $Envelope.PSObject.Properties['result']
+        $text = if ($null -eq $result) { '' } else { [string]$result.Value }
+
+        if (($null -ne $status) -and ([int]$status.Value -eq 429))
+            { return $text }
+
+        if (Test-LimitWording -Text $text)
+            { return $text }
+    }
+
+    # Nothing was streamed: a refusal that lands before the session starts leaves
+    # only what the CLI printed.
+    if (Test-LimitWording -Text $Stderr)
+        { return $Stderr.Trim() }
+
+    return $null
+}
+
+function Test-LimitWording
+{
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text))
+        { return $false }
+
+    return ($Text -match '(?i)(hit|reached|exceeded) your [^.]{0,40}limit|usage limit reached|rate.?limit')
 }
 
 function Invoke-ModelPrompt
@@ -110,30 +157,62 @@ function Invoke-ModelPrompt
             Start-Sleep -Milliseconds 150
         }
 
-        if ($process.ExitCode -ne 0)
-        {
-            $stderr = if (Test-Path $errFile) { (Get-Content -LiteralPath $errFile -Raw) } else { '' }
-            throw "claude exited $($process.ExitCode) for '$Label'. $stderr"
-        }
+        $stderr = if (Test-Path $errFile) { [string](Get-Content -LiteralPath $errFile -Raw) } else { '' }
 
-        # One JSON event per line; the final "result" event carries the envelope.
+        # One JSON event per line; the final "result" event carries the envelope. It
+        # is read before the exit code is judged: a drained subscription window is
+        # reported in the envelope as a 429 with the limit notice in place of the
+        # answer, and the CLI exits non-zero for it, so testing the code first would
+        # bury the reason under a bare "claude exited 1".
         $envelope = $null
         foreach ($line in Get-Content -LiteralPath $outFile -Encoding utf8)
         {
             if ([string]::IsNullOrWhiteSpace($line))
                 { continue }
 
-            $record = $line | ConvertFrom-Json
+            try
+                { $record = $line | ConvertFrom-Json }
+            catch
+                { continue }
+
             if ($record.type -eq 'result')
                 { $envelope = $record }
         }
 
+        if ($null -ne $envelope)
+        {
+            $global:PodofoModelStats.Calls++
+            $global:PodofoModelStats.CostUsd += $envelope.total_cost_usd
+            $global:PodofoModelStats.Turns += $envelope.num_turns
+        }
+
+        # A refused call is a pause, not a failure, so it is raised under its own
+        # error id: a driver wants to stop and say when the window reopens rather
+        # than treat the item as broken. Checked whatever the exit code turned out to
+        # be, and off stderr too, in case the refusal arrives before any event.
+        $notice = Get-RateLimitNotice -Envelope $envelope -Stderr $stderr
+        if ($null -ne $notice)
+        {
+            # The event stream carries the window and its reset; the notice wording
+            # is read when it does not. Both helpers live in audit-common, so a seam
+            # used on its own still raises the same id with the raw notice.
+            $message = if ($null -ne (Get-Command Format-RateLimitBlock -ErrorAction SilentlyContinue))
+                { Format-RateLimitBlock -Block (Get-RateLimitBlock -RawLog $outFile -Notice $notice) -Fallback $notice }
+            else
+                { "Subscription limit reached: $notice" }
+
+            throw [System.Management.Automation.ErrorRecord]::new(
+                [System.Exception]::new("$message ('$Label' did not run.)"),
+                'PodofoRateLimitReached',
+                [System.Management.Automation.ErrorCategory]::LimitsExceeded,
+                $Label)
+        }
+
+        if ($process.ExitCode -ne 0)
+            { throw "claude exited $($process.ExitCode) for '$Label'. $stderr" }
+
         if ($null -eq $envelope)
             { throw "No result event in the run log for '$Label' ($outFile)." }
-
-        $global:PodofoModelStats.Calls++
-        $global:PodofoModelStats.CostUsd += $envelope.total_cost_usd
-        $global:PodofoModelStats.Turns += $envelope.num_turns
 
         if ($envelope.is_error)
             { throw "Model call failed for '$Label': $($envelope.subtype) / $($envelope.result)" }

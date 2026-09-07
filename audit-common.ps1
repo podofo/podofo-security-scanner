@@ -437,6 +437,206 @@ function Get-UsageStatus
     return $global:PodofoUsage.Text
 }
 
+# An exhausted subscription window arrives on the same channel as the usage figures:
+# a rate_limit_event, this time with status 'rejected'. The event names the window
+# that ran out and when it comes back, so a run stopped by a limit can say which
+# limit and how long the wait is instead of just echoing an HTTP status.
+#
+# The event is not always there: a refusal that comes back before the session has
+# reported any usage carries only the provider's notice text, so -Notice is read as
+# a second source. Unlike Get-UsageStatus nothing is cached here; this runs once,
+# after the call has already failed, and the newest event is the refusal itself.
+function Get-RateLimitBlock
+{
+    param([string]$RawLog, [string]$Notice)
+
+    $block = Get-RateLimitEventBlock -RawLog $RawLog
+    if ($null -ne $block)
+        { return $block }
+
+    return Get-RateLimitNoticeBlock -Notice $Notice
+}
+
+function Get-RateLimitEventBlock
+{
+    param([string]$RawLog)
+
+    if ([string]::IsNullOrEmpty($RawLog))
+        { return $null }
+
+    $all = Read-SharedLines -Path $RawLog
+    if ($null -eq $all)
+        { return $null }
+
+    $labels = @{ five_hour = 'five-hour session'; seven_day = 'weekly' }
+
+    for ($i = $all.Count - 1; $i -ge 0; $i--)
+    {
+        if ($all[$i] -notmatch '"rate_limit_event"')
+            { continue }
+
+        try
+            { $record = $all[$i] | ConvertFrom-Json }
+        catch
+            { continue }
+
+        $info = Get-Field -Object $record -Name 'rate_limit_info'
+        if ($null -eq $info)
+            { continue }
+
+        # Only the newest reading counts, and only when it is the refusal: an older
+        # 'allowed' event says nothing about what has just run out, and reporting the
+        # window it names would blame the wrong limit. The notice is tried instead.
+        if ((Get-Field -Object $info -Name 'status') -ne 'rejected')
+            { return $null }
+
+        $window = [string](Get-Field -Object $info -Name 'rateLimitType')
+        $resetsAt = Get-Field -Object $info -Name 'resetsAt'
+
+        # Both carry a reset; the per-window figure is the one that belongs to the
+        # window being reported, so prefer it when the pair disagree.
+        $windows = Get-Field -Object $info -Name 'unifiedWindows'
+        if (($null -ne $windows) -and (-not [string]::IsNullOrEmpty($window)))
+        {
+            $bucket = Get-Field -Object $windows -Name $window
+            if ($null -ne $bucket)
+            {
+                $own = Get-Field -Object $bucket -Name 'resetsAt'
+                if ($null -ne $own)
+                    { $resetsAt = $own }
+            }
+        }
+
+        # Unix seconds, UTC. A shape that does not convert is treated as no reset
+        # rather than allowed to throw inside failure handling.
+        $reset = $null
+        if ($null -ne $resetsAt)
+        {
+            try
+                { $reset = [datetimeoffset]::FromUnixTimeSeconds([long]$resetsAt).ToLocalTime().DateTime }
+            catch
+                { $reset = $null }
+        }
+
+        $label = if ($labels.ContainsKey($window)) { $labels[$window] } else { '' }
+        return [pscustomobject]@{
+            Window   = $window
+            Label    = $label
+            ResetsAt = $reset
+        }
+    }
+
+    return $null
+}
+
+# The notice is a provider's UI string ("You've hit your session limit - resets
+# 4:50pm (Europe/Rome)"), so it is parsed defensively: an unrecognised shape yields
+# nothing rather than a wrong reset. The bracketed zone is the caller's own, which is
+# why the clock is read as local time.
+function Get-RateLimitNoticeBlock
+{
+    param([string]$Notice)
+
+    if ([string]::IsNullOrWhiteSpace($Notice))
+        { return $null }
+
+    $label = if ($Notice -match '(?i)\bweek')
+        { 'weekly' }
+    elseif ($Notice -match '(?i)\bsession\b')
+        { 'five-hour session' }
+    else
+        { '' }
+
+    $reset = $null
+    if ($Notice -match '(?i)resets?\s+(?:at\s+)?(?<when>[^()]+?)\s*(?:\([^()]*\))?\s*$')
+    {
+        $when = ($Matches['when'] -replace '(?i)\s+at\s+', ' ').Trim()
+
+        # A 12-hour clock arrives with the meridiem attached; .NET wants it apart.
+        $when = $when -replace '(?i)(\d)\s*(am|pm)', '$1 $2'
+
+        # Exact formats only. A loose TryParse accepts these strings and then
+        # answers with something unrelated - 'Sep 14 4:50 pm' came back as the
+        # current time - which is worse than reporting no reset at all.
+        # Typed: an object[] of formats binds to the single-format overload and
+        # every parse then fails.
+        [string[]]$formats = @('h:mm tt', 'h tt', 'H:mm', 'MMM d h:mm tt', 'MMM d h tt',
+            'MMM d, h:mm tt', 'MMM d yyyy h:mm tt', 'MMM d, yyyy h:mm tt')
+
+        $parsed = [datetime]::MinValue
+        if ([datetime]::TryParseExact($when, $formats, [cultureinfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::AllowWhiteSpaces, [ref]$parsed))
+        {
+            # A clock with no date parses onto today, and a date with no year onto
+            # this year; either lands in the past when the window reopens across the
+            # boundary, and rolling it forward is the only reading that makes sense
+            # for a reset.
+            $timeOnly = $when -match '^\d{1,2}(:\d{2})?\s*(?i:am|pm)?$'
+            if ($parsed -lt (Get-Date).AddMinutes(-5))
+            {
+                $parsed = if ($timeOnly) { $parsed.AddDays(1) } else { $parsed.AddYears(1) }
+            }
+
+            $reset = $parsed
+        }
+    }
+
+    if (($label -eq '') -and ($null -eq $reset))
+        { return $null }
+
+    return [pscustomobject]@{
+        Window   = ''
+        Label    = $label
+        ResetsAt = $reset
+    }
+}
+
+# The sentence a run prints when it stops on a limit. The window is only named when
+# the event was explicit about it: guessing 'weekly' at a five-hour pause would send
+# someone away for days. -Fallback is the provider's own wording, used when the event
+# is missing or says nothing useful.
+function Format-RateLimitBlock
+{
+    param([psobject]$Block, [string]$Fallback)
+
+    $limit = 'Subscription limit reached'
+    if (($null -ne $Block) -and (-not [string]::IsNullOrEmpty($Block.Label)))
+        { $limit = 'The {0} limit is used up' -f $Block.Label }
+
+    if (($null -eq $Block) -or ($null -eq $Block.ResetsAt))
+    {
+        if (-not [string]::IsNullOrEmpty($Fallback))
+            { return '{0}: {1}' -f $limit, $Fallback.Trim() }
+
+        return '{0}; the reset time was not reported.' -f $limit
+    }
+
+    $when = $Block.ResetsAt.ToString('yyyy-MM-dd HH:mm')
+    $wait = $Block.ResetsAt - (Get-Date)
+    if ($wait.TotalMinutes -lt 1)
+        { return '{0}. Resets at {1}, any moment now.' -f $limit, $when }
+
+    # A weekly window can be days out, where minutes are noise.
+    $waitText = if ($wait.TotalHours -lt 1)
+        { '{0}m' -f [int]$wait.TotalMinutes }
+    elseif ($wait.TotalDays -lt 1)
+        { '{0}h {1}m' -f $wait.Hours, $wait.Minutes }
+    else
+        { '{0}d {1}h' -f [int][Math]::Floor($wait.TotalDays), $wait.Hours }
+
+    return '{0}. Resets at {1}, {2} from now.' -f $limit, $when, $waitText
+}
+
+# The seam signals an exhausted window with this error id, so a driver can tell a
+# pause apart from a failure without matching on message text. A replacement seam
+# has to raise the same id to get the clean stop; anything else is a hard error.
+function Test-RateLimitError
+{
+    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    return ([string]$ErrorRecord.FullyQualifiedErrorId).StartsWith('PodofoRateLimitReached')
+}
+
 #endregion
 
 #region Activity line
