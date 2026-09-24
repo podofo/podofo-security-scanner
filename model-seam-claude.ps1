@@ -92,6 +92,38 @@ function Test-LimitWording
     return ($Text -match '(?i)(hit|reached|exceeded) your [^.]{0,40}limit|usage limit reached|rate.?limit')
 }
 
+# Collects whatever explains a failed call: the envelope subtype, its errors list
+# and result text, and stderr. Returns an empty string when none is available.
+function Get-FailureReason
+{
+    param([psobject]$Envelope, [string]$Stderr)
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    if ($null -ne $Envelope)
+    {
+        # StrictMode throws on an absent property, so the fields come off the property bag.
+        foreach ($name in @('subtype', 'errors', 'result'))
+        {
+            $property = $Envelope.PSObject.Properties[$name]
+            if ($null -eq $property)
+                { continue }
+
+            # A failed call can still report subtype "success", which explains nothing.
+            $text = (@($property.Value) | ForEach-Object { [string]$_ }) -join '; '
+            if (($name -eq 'subtype') -and ($text -eq 'success'))
+                { continue }
+
+            if (-not [string]::IsNullOrWhiteSpace($text))
+                { $parts.Add($text.Trim()) }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Stderr))
+        { $parts.Add($Stderr.Trim()) }
+
+    return ($parts -join ' | ')
+}
+
 function Invoke-ModelPrompt
 {
     param(
@@ -101,9 +133,9 @@ function Invoke-ModelPrompt
         [string[]]$AllowDir,
         [scriptblock]$OnWait,
         [string]$RunLog,
-        [string]$Model = 'claude-opus-5',
+        [string]$Model = 'claude-opus-5-5[1m]',
         [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')][string]$Effort = 'high',
-        [double]$MaxBudgetUsd = 2.0
+        [double]$MaxBudgetUsd = 10.0
     )
 
     $work = Join-Path ([System.IO.Path]::GetTempPath()) ("podofo-audit-" + [guid]::NewGuid().ToString('N'))
@@ -208,14 +240,19 @@ function Invoke-ModelPrompt
                 $Label)
         }
 
-        if ($process.ExitCode -ne 0)
-            { throw "claude exited $($process.ExitCode) for '$Label'. $stderr" }
+        # The exit code is always 1 on failure, so the reason comes from the envelope
+        # (e.g. error_max_budget_usd) and from stderr.
+        if (($process.ExitCode -ne 0) -or (($null -ne $envelope) -and $envelope.is_error))
+        {
+            $reason = Get-FailureReason -Envelope $envelope -Stderr $stderr
+            if ([string]::IsNullOrEmpty($reason))
+                { $reason = 'no error details reported' }
+
+            throw "Model call failed for '$Label' (claude exited $($process.ExitCode)): $reason. Run log: $outFile"
+        }
 
         if ($null -eq $envelope)
             { throw "No result event in the run log for '$Label' ($outFile)." }
-
-        if ($envelope.is_error)
-            { throw "Model call failed for '$Label': $($envelope.subtype) / $($envelope.result)" }
 
         if (@($envelope.permission_denials).Count -gt 0)
             { Write-Warning "'$Label': $(@($envelope.permission_denials).Count) permission denial(s); the model was blocked from something it tried." }

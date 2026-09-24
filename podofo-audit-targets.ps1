@@ -38,6 +38,7 @@ param(
     [string]$DatabasePath,
     [string]$ScanRoot,
     [string]$ModelScript,
+    [string]$Model = 'claude-fable-5-1',
     [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')][string]$Effort = 'xhigh',
     [string]$Only,
     [string]$Id,
@@ -846,7 +847,7 @@ $interactive = Test-ConsoleInteractive
 $runHint = if ($null -eq (Get-MonitorProgram)) { "'q' stops after the current target" }
     else { "'q' stops after the current target, 'm' monitors this run" }
 
-Write-Host ("Working {0} target(s) of {1} at effort '{2}'." -f $work.Count, @($db.targets).Count, $Effort)
+Write-Host ("Working {0} target(s) of {1} with {3} at effort '{2}'." -f $work.Count, @($db.targets).Count, $Effort, $Model)
 Write-StopHint -Interactive $interactive
 
 # The status row would otherwise open blank: the log a call writes has no usage
@@ -882,7 +883,7 @@ foreach ($target in $work)
     try
     {
         $audit = Invoke-ModelPrompt -Prompt (New-AuditPrompt -Target $target -Database $db) `
-            -Schema $auditSchema -Effort $Effort -Label "audit:$label" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+            -Schema $auditSchema -Model $Model -Effort $Effort -Label "audit:$label" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
     }
     catch
     {
@@ -921,7 +922,7 @@ foreach ($target in $work)
     try
     {
         $validation = Invoke-ModelPrompt -Prompt (New-ValidatePrompt -Target $target -Database $db -ReportPath $reportPath) `
-            -Schema $validateSchema -Effort $Effort -Label "validate:$label" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+            -Schema $validateSchema -Model $Model -Effort $Effort -Label "validate:$label" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
     }
     catch
     {

@@ -51,6 +51,7 @@ param(
     [string]$DatabasePath,
     [string]$ScanRoot,
     [string]$ModelScript,
+    [string]$Model = 'claude-fable-5-1',
     [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')][string]$Effort = 'xhigh',
     [string]$Only,
     [switch]$Redo,
@@ -543,7 +544,7 @@ function Format-ResultAnnotation
 #region Main
 
 $db = Read-Database
-$entries = Get-Entries -Database $db
+$entries = @(Get-Entries -Database $db)
 
 # Ignored files stay in $entries so the checklist still shows them, but they are not
 # work and they are not part of the total the run reports against.
@@ -583,7 +584,7 @@ $interactive = Test-ConsoleInteractive
 $runHint = if ($null -eq (Get-MonitorProgram)) { "'q' stops after the current file" }
     else { "'q' stops after the current file, 'm' monitors this run" }
 
-Write-Host ("Analysing {0} pending file(s) of {1} at effort '{2}'." -f $pending.Count, $total, $Effort)
+Write-Host ("Analysing {0} pending file(s) of {1} with {3} at effort '{2}'." -f $pending.Count, $total, $Effort, $Model)
 Write-StopHint -Interactive $interactive
 
 # The status row would otherwise open blank: the log a call writes has no usage
@@ -626,7 +627,7 @@ foreach ($entry in $pending)
                 -Text ("Analysing {0} ({1} lines)..." -f [System.IO.Path]::GetFileName($entry.File.path), $lineCount)
             try
             {
-                $recon = Invoke-ModelPrompt -Prompt $prompt -Schema $reconSchema -Effort $Effort `
+                $recon = Invoke-ModelPrompt -Prompt $prompt -Schema $reconSchema -Model $Model -Effort $Effort `
                     -Label "recon:$($entry.File.path)" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
             }
             catch
