@@ -64,8 +64,15 @@ function Get-RateLimitNotice
     if ($null -ne $Envelope)
     {
         $status = $Envelope.PSObject.Properties['api_error_status']
+        $isError = $Envelope.PSObject.Properties['is_error']
         $result = $Envelope.PSObject.Properties['result']
         $text = if ($null -eq $result) { '' } else { [string]$result.Value }
+
+        # On a successful call 'result' is the model's own answer, which can say
+        # anything: "degenerate limits" once matched the wording below and stopped a
+        # healthy run. Only a failed envelope can be a refusal.
+        if (($null -eq $isError) -or (-not [bool]$isError.Value))
+            { return $null }
 
         if (($null -ne $status) -and ([int]$status.Value -eq 429))
             { return $text }
@@ -89,7 +96,7 @@ function Test-LimitWording
     if ([string]::IsNullOrWhiteSpace($Text))
         { return $false }
 
-    return ($Text -match '(?i)(hit|reached|exceeded) your [^.]{0,40}limit|usage limit reached|rate.?limit')
+    return ($Text -match '(?i)\b(hit|reached|exceeded) your [^.]{0,40}limit|\busage limit reached|\brate.?limit')
 }
 
 # Collects whatever explains a failed call: the envelope subtype, its errors list
