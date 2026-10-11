@@ -296,8 +296,15 @@ function Format-DedupContext
     {
         $lines += 'Accepted findings elsewhere in the codebase:'
         foreach ($row in $elsewhere)
-            { $lines += ('- [{0}] {1} in {2}' -f (Get-Field -Object $row -Name 'severity'), (Get-Field -Object $row -Name 'slug'), $row.origin_file) }
+            { $lines += ('- [{0}] {1} in {2}, id {3}' -f (Get-Field -Object $row -Name 'severity'), (Get-Field -Object $row -Name 'slug'), $row.origin_file, $row.id) }
     }
+
+    # A reset target is still cited by rows validated against its earlier verdict, and
+    # without this the auditor reads those citations as a prior record of itself.
+    $lines += ''
+    $lines += ("This target is id {0} and has no recorded verdict. Any mention of {0} in the findings " +
+        "above, in recon notes or in files under scan/ refers to this same investigation, not to an " +
+        "existing finding, so it can never make this target a duplicate.") -f $ExcludeId
 
     return ($lines -join "`n")
 }
