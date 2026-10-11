@@ -5,7 +5,8 @@ Helpers shared by podofo-recon-plan.ps1 and podofo-audit-targets.ps1.
 .DESCRIPTION
 Identity derivation lives here rather than in each script: if Get-ScanFileKey or
 Get-TargetId drifted between the two phases the store would silently split, with the
-audit phase unable to find the recon it is working from.
+audit phase unable to find the recon it is working from. The same goes for how an
+audit target's state is derived from disk, which podofo-audit-status.ps1 shares.
 #>
 
 # Set-Content truncates the target and then writes, so an interrupt landing in that
@@ -20,6 +21,7 @@ function Write-FileAtomic
 
     $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
     $temp = "$full.tmp"
+    [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($full)) | Out-Null
     Set-Content -LiteralPath $temp -Value $Content -Encoding utf8
     [System.IO.File]::Move($temp, $full, $true)
 }
@@ -72,6 +74,195 @@ function Get-TargetId
     $bytes = [System.Text.Encoding]::UTF8.GetBytes("$OriginFile`n$Target")
     $hash = [System.Security.Cryptography.SHA256]::HashData($bytes)
     return ((($hash[0..3]) | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function Read-JsonFile
+{
+    param([Parameter(Mandatory)][string]$Path)
+
+    return (Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json)
+}
+
+# The audit target registry holds only what cannot be derived: the seq each target was
+# given, plus its id, source and origin file to keep the list readable.
+function Read-TargetRegistry
+{
+    param([Parameter(Mandatory)][string]$Path)
+
+    $rows = [System.Collections.Generic.List[psobject]]::new()
+    if (Test-Path -LiteralPath $Path)
+    {
+        foreach ($row in @((Read-JsonFile -Path $Path).targets))
+            { $rows.Add($row) }
+    }
+
+    return [pscustomobject]@{ Path = $Path; Targets = $rows }
+}
+
+# Everything under scan/targets the audit phase derives its state from: the recon of
+# each file, the record of each target worked so far, and the definition of every
+# target either of them proposes. Recon targets come first, in a stable order; spawned
+# targets follow, see Update-SpawnedDefinitions.
+function Read-AuditSources
+{
+    param([Parameter(Mandatory)][string]$TargetsRoot)
+
+    $recon = @{}
+    $records = @{}
+    if (Test-Path -LiteralPath $TargetsRoot)
+    {
+        foreach ($file in Get-ChildItem -LiteralPath $TargetsRoot -Filter '*.json' -Recurse -File | Sort-Object FullName)
+        {
+            if ($file.Name -eq 'recon.json')
+            {
+                $data = Read-JsonFile -Path $file.FullName
+                $recon[$data.origin_file] = $data
+            }
+            elseif ($file.Name -match '^[0-9a-f]{8}\.json$')
+            {
+                $data = Read-JsonFile -Path $file.FullName
+                $records[$data.id] = $data
+            }
+        }
+    }
+
+    $definitions = [ordered]@{}
+    foreach ($origin in @($recon.Keys | Sort-Object))
+    {
+        foreach ($target in @($recon[$origin].recon.proposed_targets))
+        {
+            $definitions[$target.id] = [pscustomobject]@{
+                id          = $target.id
+                source      = 'recon'
+                origin_file = $origin
+                target      = $target.target
+                rationale   = $target.rationale
+                confidence  = $target.confidence
+            }
+        }
+    }
+
+    $sources = [pscustomobject]@{ Recon = $recon; Records = $records; Definitions = $definitions }
+    Update-SpawnedDefinitions -Sources $sources
+    return $sources
+}
+
+# Spawned targets are defined by the validation records of their parents, so they
+# change whenever a record does: an audit redone mid-run drops the old validation, and
+# with it the targets that validation spawned. Rebuilt whole rather than patched, since
+# two parents can spawn the same target. Listed in the order their parents were
+# validated, which is the order a live run registers them in.
+function Update-SpawnedDefinitions
+{
+    param([Parameter(Mandatory)][psobject]$Sources)
+
+    $definitions = $Sources.Definitions
+    foreach ($id in @($definitions.Keys | Where-Object { $definitions[$_].source -eq 'spawned' }))
+        { $definitions.Remove($id) }
+
+    $validated = @($Sources.Records.Values | Where-Object { $null -ne (Get-Field -Object $_ -Name 'validation') } |
+        Sort-Object { $_.validation.utc })
+    foreach ($parent in $validated)
+    {
+        foreach ($text in @(Get-Field -Object $parent.validation -Name 'spawned_targets'))
+        {
+            if ([string]::IsNullOrEmpty($text))
+                { continue }
+
+            $id = Get-TargetId -OriginFile $parent.origin_file -Target $text
+            if ($definitions.Contains($id))
+                { continue }
+
+            $definitions[$id] = [pscustomobject]@{
+                id          = $id
+                source      = 'spawned'
+                origin_file = $parent.origin_file
+                target      = $text
+                rationale   = "Spawned while validating $($parent.id)."
+                confidence  = 'medium'
+            }
+        }
+    }
+}
+
+# No record means the target has not been worked; a record without a validation means
+# the audit is in and the validation is not. An orphan is a target nothing defines any
+# more: it keeps the verdict it had, and one without a verdict will never get one, so
+# it is not shown as waiting for one.
+function Get-TargetState
+{
+    param([psobject]$Record, [bool]$Orphaned)
+
+    $validation = if ($null -ne $Record) { Get-Field -Object $Record -Name 'validation' } else { $null }
+    if ($null -ne $validation)
+        { return [string]$validation.verdict }
+    if ($Orphaned)
+        { return 'orphaned' }
+    if ($null -ne $Record)
+        { return 'audited' }
+
+    return 'pending'
+}
+
+function New-AuditTarget
+{
+    param(
+        $Seq,
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$OriginFile,
+        [Parameter(Mandatory)][psobject]$Sources
+    )
+
+    $definition = if ($Sources.Definitions.Contains($Id)) { $Sources.Definitions[$Id] } else { $null }
+    $record = $Sources.Records[$Id]
+    $recon = $Sources.Recon[$OriginFile]
+
+    # An orphan has nothing defining it any more, but if it was worked its record still
+    # says what it asked.
+    $asked = if ($null -ne $definition) { $definition } else { $record }
+
+    return [pscustomobject]@{
+        seq         = $Seq
+        id          = $Id
+        source      = $Source
+        origin_file = $OriginFile
+        priority    = if ($null -ne $recon) { [string]$recon.recon.audit_priority } else { 'none' }
+        confidence  = if ($null -ne $asked) { [string](Get-Field -Object $asked -Name 'confidence') } else { '' }
+        target      = if ($null -ne $asked) { [string](Get-Field -Object $asked -Name 'target') } else { '' }
+        rationale   = if ($null -ne $asked) { [string](Get-Field -Object $asked -Name 'rationale') } else { '' }
+        orphaned    = ($null -eq $definition)
+        state       = Get-TargetState -Record $record -Orphaned ($null -eq $definition)
+        Record      = $record
+    }
+}
+
+# One object per registered target: what it asks from its source, what happened to it
+# from its record. Targets a source defines that the registry has not seen yet follow
+# with no seq; only a reader that does not register them, such as the status script,
+# ever meets one.
+function Get-AuditTargets
+{
+    param(
+        [Parameter(Mandatory)][psobject]$Registry,
+        [Parameter(Mandatory)][psobject]$Sources
+    )
+
+    $targets = [System.Collections.Generic.List[psobject]]::new()
+    $registered = @{}
+    foreach ($row in $Registry.Targets)
+    {
+        $registered[$row.id] = $true
+        $targets.Add((New-AuditTarget -Seq $row.seq -Id $row.id -Source $row.source -OriginFile $row.origin_file -Sources $Sources))
+    }
+
+    foreach ($definition in $Sources.Definitions.Values)
+    {
+        if (-not $registered.ContainsKey($definition.id))
+            { $targets.Add((New-AuditTarget -Seq $null -Id $definition.id -Source $definition.source -OriginFile $definition.origin_file -Sources $Sources)) }
+    }
+
+    return $targets
 }
 
 # Tuned for a light terminal background, so White, Yellow, Cyan, Green and Gray are

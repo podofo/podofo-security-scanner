@@ -1,30 +1,37 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-Prints the progress of the audit pass from podofo-audit-targets.json.
+Prints the progress of the audit pass.
 
 .DESCRIPTION
-Read-only. The first table counts targets per priority and state; the second breaks
-each priority down by recon confidence, as pending/total. Safe to run while
-podofo-audit-targets.ps1 is working, since the database is only ever replaced whole.
+Read-only. State is derived the same way podofo-audit-targets.ps1 derives it: the
+registry podofo-audit-targets.json, the recon files, and the per-target records under
+scan/targets. Targets a recon file defines but no audit run has registered yet are
+counted as pending. The first table counts targets per priority and state; the second
+breaks each priority down by recon confidence, as pending/total. Safe to run while an
+audit pass is working, since every file it reads is only ever replaced whole.
 #>
 
 [CmdletBinding()]
 param(
-    [string]$DatabasePath
+    [string]$DatabasePath,
+    [string]$ScanRoot
 )
 
 $ErrorActionPreference = 'stop'
 Set-StrictMode -Version Latest
 
+if ([string]::IsNullOrEmpty($ScanRoot))
+    { $ScanRoot = Join-Path $PSScriptRoot 'scan' }
 if ([string]::IsNullOrEmpty($DatabasePath))
-    { $DatabasePath = Join-Path $PSScriptRoot 'podofo-audit-targets.json' }
+    { $DatabasePath = Join-Path $ScanRoot 'podofo-audit-targets.json' }
 
 . (Join-Path $PSScriptRoot 'audit-common.ps1')
 
-$db = Get-Content -LiteralPath $DatabasePath -Raw | ConvertFrom-Json
-# Wrapped: a single-target database unrolls to a bare object.
-$targets = @($db.targets)
+$targetsRoot = Join-Path $ScanRoot 'targets'
+$registry = Read-TargetRegistry -Path $DatabasePath
+# Wrapped: a single target unrolls to a bare object.
+$targets = @(Get-AuditTargets -Registry $registry -Sources (Read-AuditSources -TargetsRoot $targetsRoot))
 
 $priorities = @('high', 'medium', 'low', 'none') |
     Where-Object { $p = $_; @($targets | Where-Object { $_.priority -eq $p }).Count -gt 0 }
@@ -99,11 +106,16 @@ function Write-BoxTable
 # A Windows console may still be on a legacy code page, which has no box characters.
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-$spawnedPending = @($targets | Where-Object {
-    (Get-Field -Object $_ -Name 'source') -eq 'spawned' -and $_.state -eq 'pending' }).Count
-$written = (Get-Item -LiteralPath $DatabasePath).LastWriteTime
+$spawnedPending = @($targets | Where-Object { $_.source -eq 'spawned' -and $_.state -eq 'pending' }).Count
 
-Write-Host "Targets by state  (database written $($written.ToString('yyyy-MM-dd HH:mm')))"
+# The registry changes only when targets appear; the records change with every step.
+$records = @(Get-ChildItem -LiteralPath $targetsRoot -Filter '*.json' -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^[0-9a-f]{8}\.json$' })
+$activity = if ($records.Count -gt 0)
+    { "  (last record written $((($records | Measure-Object LastWriteTime -Maximum).Maximum).ToString('yyyy-MM-dd HH:mm')))" }
+    else { '' }
+
+Write-Host "Targets by state$activity"
 Write-BoxTable -Rows @($stateRows)
 Write-Host ''
 Write-Host 'Targets by confidence  (pending/total)'

@@ -17,53 +17,86 @@ Everything here is PowerShell 7, `Set-StrictMode -Version Latest`,
 
 ### `podofo-recon-plan.ps1` - phase one, reconnaissance
 
-Reads `podofo-recon-plan.json`, a work list of 157 source files grouped into tiers,
-and analyses one file per model call. Each call characterises the file as an audit
-surface and proposes investigation targets. The database doubles as progress state:
-a file carries `done`, an optional `description` and a short `result`, and is saved
-after every file, so a stopped run resumes where it left off.
-
-An entry in `files` is either an object or a bare path string; the string means a
-pending, non-ignored file, and an entry that carries nothing else is written back as
-one. `"ignore": true` drops a file from the run - it is never analysed and never part
-of the count the run reports against, but it stays on the checklist marked `[-]`, so
-the decision stays visible rather than being lost by deleting the line.
+Reads `scan/podofo-recon-plan.json`, a work list of 157 source files grouped into
+tiers, and analyses one file per model call. Each call characterises the file as an
+audit surface and proposes investigation targets.
 
 Full recon output goes to `scan/targets/<file-key>/recon.json`, where `<file-key>`
-is the path with `src/podofo/` stripped and `/` flattened to `-`.
+is the path with `src/podofo/` stripped and `/` flattened to `-`. That file is the
+progress state: a file is done exactly when its `recon.json` exists, and the result
+on the checklist is read back from it. Writing it is the single commit point, so a
+stopped run resumes where it left off. A `recon.json` whose `origin_file` differs from
+the plan path stops the run, since it means two paths flatten to the same folder.
+
+The plan itself holds no run state and the script never writes it, so it can be
+edited while a run is going. An entry in `files` is either an object or a bare path
+string; objects carry an optional `description` or `"ignore": true`. An ignored file
+is never analysed and never part of the count the run reports against, but it stays
+on the checklist marked `[-]`, so the decision stays visible rather than being lost by
+deleting the line. Files missing on disk or generated are skipped the same way,
+decided afresh on every run rather than recorded.
 
 ### `podofo-audit-targets.ps1` - phase two, audit and validation
 
-Syncs `podofo-audit-targets.json` from the `recon.json` files, then works the queue
-in priority order. Each target gets two separate model calls: an audit that produces
-the report, then a validation that accepts or rejects it. They are separate processes
-so the validator structurally cannot see the auditor's reasoning.
+Works the target queue in priority order. Each target gets two separate model
+calls: an audit that produces the report, then a validation that accepts or rejects
+it. They are separate processes so the validator structurally cannot see the
+auditor's reasoning.
+
+Each kind of state has one home:
+
+- `scan/podofo-audit-targets.json` is only a registry: `seq`, `id`, `source` and
+  `origin_file` per target. `seq` is the one thing that cannot be derived; it gives
+  each target a stable number in the order it first appeared.
+- What a target asks (`target`, `rationale`, `confidence`) comes from its source:
+  the `recon.json` of its file for `source: recon`, the validation record of the
+  target that spawned it for `source: spawned`. `priority` is always the current
+  `audit_priority` of the origin file's recon, so a redone recon re-ranks its targets.
+- What happened to it is its record, `scan/targets/<file-key>/<id>.json`: the target
+  as asked, the full structured audit output and the full validation output, each
+  with a `utc` stamp; `audit.severity` is optional, as the earliest records lack it.
+  A validator's `spawned_targets` live in its record and define the spawned targets,
+  the way `proposed_targets` in `recon.json` define recon ones.
+
+State machine, derived rather than stored: no record is `pending`, a record with only
+an audit is `audited`, a validated record is its verdict. A registered target that its
+source no longer defines is `orphaned`: it keeps its verdict if it had one, shows as
+`orphaned` otherwise, and is never worked, even with `-Redo`. That applies to spawned
+targets too, when a redone parent no longer proposes them, including partway through
+the `-Redo` run that re-audits the parent.
 
 Targets carry a content-derived id (`SHA256(origin_file + "\n" + target)`, first 8
-hex characters), so the queue can be re-synced while phase one is still running: new
-targets are appended as `pending`, existing rows are never touched, and targets whose
-recon entry vanished are flagged `orphaned` rather than deleted. Targets the
-validator spawns are marked `source: spawned` so a later sync cannot orphan them.
+hex characters), so the registry can be synced while phase one is still running:
+every run starts by registering targets that sources define and the registry has not
+seen, and nothing is ever removed from it.
 
-State machine: `pending` -> `audited` -> `accepted` or `rejected`.
+The record is the commit point and is saved after each of the two calls, so a run
+stopped between them resumes at validation without paying for the audit again. The
+report is rendered after the record is saved.
 
 Reports land next to the recon that produced them, at
-`scan/targets/<file-key>/<descriptive-slug>-<id>.md`. The slug comes from the
-finding, so it changes when validation revises it; the id is the stable handle, and
-report lookup globs `*<id>.md` so renames clean up after themselves.
+`scan/targets/<file-key>/<descriptive-slug>-<id>.md`, rendered by the script from the
+record. The slug comes from the finding, so it changes when validation revises it; the
+id is the stable handle, and report lookup globs `*<id>.md` so renames clean up after
+themselves. Before working anything, a run renders again every report that does not
+match its record, so a stop between saving a record and rendering it is put right,
+and a validator resuming a target never reads a report carrying an earlier verdict.
+`-RenderReports` does only that, for when the report format changes.
 
 ### `podofo-audit-status.ps1` - progress report
 
 Read-only. Prints the target queue as two tables: per priority by state, and per
 priority by recon confidence as pending/total, followed by how many pending targets
-the validator spawned. Safe to run alongside a live audit pass.
+the validator spawned. It derives state through the same loader as the audit script,
+so targets a recon file defines but no audit run has registered yet count as pending.
+Safe to run alongside a live audit pass.
 
 ### Running them
 
 Both take `-Model` (default `claude-fable-5-1`), `-Effort` (`low` to `max`, default
 `xhigh`), `-Only`, `-Redo` and `-DryRun`;
-the audit script adds `-Id`, `-MinPriority`, `-MaxTargets`, `-MaxSpendUsd` and
-`-SyncOnly`. Paths (`-RepoRoot`, `-ScanRoot`, `-DatabasePath`, `-ModelScript`) all
+the audit script adds `-Id`, `-MinPriority`, `-MaxTargets`, `-MaxSpendUsd`,
+`-SyncOnly` and `-RenderReports`. Paths (`-RepoRoot`, `-ScanRoot`, `-DatabasePath`, `-ModelScript`) all
 default relative to the script.
 
 The activity display is two rows: the spinner and the current item, then a status
@@ -85,6 +118,8 @@ Shared helpers, dot-sourced by both scripts. Identity derivation lives here so t
 two phases cannot drift apart:
 
 - `Get-ScanFileKey`, `Get-TargetId` - the path and target identity rules above
+- `Read-TargetRegistry`, `Read-AuditSources`, `Get-AuditTargets` - the audit target
+  state derivation above, shared with the status script so the two cannot disagree
 - `Write-FileAtomic` - write to a temp file, then `File.Move(..., overwrite)`, so
   Ctrl-C cannot leave a half-written database
 - `Get-Field` / `Set-Field` - StrictMode throws on both reading and writing an absent
@@ -144,7 +179,8 @@ buries the reason under a bare `claude exited 1` - and stderr is checked too, fo
 refusal that lands before anything is streamed. The seam raises it with the error id
 `PodofoRateLimitReached`, its message naming the window and when it reopens. Both
 drivers catch that one id, print it, and stop after the item they were on, leaving it
-pending; every other error still ends the run loudly.
+where it was - pending, or audited when the audit was already saved; every other error
+still ends the run loudly.
 
 Swapping in another provider means replacing only this file
 (`-ModelScript <path>`); the contract is `-Prompt -Schema -Label -AllowDir -OnWait
@@ -159,22 +195,23 @@ signature survives), so run transcripts cannot include model reasoning.
 ```
 governance/security-audit/
 ├── podofo-recon-plan.ps1      phase one driver
-├── podofo-recon-plan.json     file work list and progress        (gitignored)
 ├── podofo-audit-targets.ps1   phase two driver
-├── podofo-audit-targets.json  target queue and verdicts          (gitignored)
 ├── podofo-audit-status.ps1    progress tables for the audit queue
 ├── audit-common.ps1           shared helpers
 ├── model-seam-claude.ps1      Invoke-ModelPrompt for Claude
 ├── .editorconfig              LF, UTF-8, 4-space indent
-└── scan/                      all generated output               (gitignored)
+└── scan/                      all generated output and state     (gitignored)
+    ├── podofo-recon-plan.json                 file work list
+    ├── podofo-audit-targets.json              audit target registry
     ├── targets/<file-key>/recon.json          phase one output
-    ├── targets/<file-key>/<slug>-<id>.md      reports
+    ├── targets/<file-key>/<id>.json           audit and validation record
+    ├── targets/<file-key>/<slug>-<id>.md      reports, rendered from the record
     ├── runs/{recon,audit}/*.log               formatted transcripts
     └── runs/{recon,audit}-monitor.jsonl       raw event stream, current call
 ```
 
-The databases are gitignored because they are progress state for a long run, not
-source. The reports are the deliverable.
+The databases live in `scan/`, created if missing, because they belong to one audit
+run, not to the source. The reports are the deliverable.
 
 ## Working on these scripts
 
@@ -182,7 +219,7 @@ source. The reports are the deliverable.
   field that has not been set yet is the most common way to break a run. Use
   `Get-Field` / `Set-Field` for anything optional.
 - Save after every item. A run that loses an hour of model spend to a crash is worse
-  than one that writes the database too often.
+  than one that writes its state too often.
 - Changes to the console rendering are hard to test in a captured shell, where both
   `[Console]::IsOutputRedirected` and `Clear-Host` behave differently. Parse-check
   with `[System.Management.Automation.Language.Parser]::ParseFile` at minimum.

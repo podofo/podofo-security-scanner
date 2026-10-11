@@ -5,19 +5,21 @@ Vulnerability audit reconnaissance pass: analyses every file in podofo-recon-pla
 one after another, and records proposed investigation targets for a later audit pass.
 
 .DESCRIPTION
-The JSON database is both the work list and the progress state. Files are grouped by
-tier; each file carries a completion flag, an optional description, and the short
-result of its analysis. The database is saved after every file, so the pass resumes
-where it left off. Full recon output goes to
-governance/security-audit/scan/targets/<file-key>/recon.json.
+The JSON database is the work list only: files grouped by tier, each with an optional
+description. It holds no run state and this script never writes it, so it can be
+edited while a pass is running. Full recon output goes to
+governance/security-audit/scan/targets/<file-key>/recon.json, and that file is the
+progress state: a file is done when its recon.json exists, and the result shown on the
+checklist is read back from it. The pass resumes where it left off.
 
-A file entry may be written either as an object or as a bare path string, which means
-a pending, non-ignored file and is written back that way. Setting "ignore": true on
-an entry takes the file out of the run: it is never analysed and never counted, but
-it stays on the checklist, marked as ignored, so the decision stays visible.
+A file entry may be written either as an object or as a bare path string. Setting
+"ignore": true on an entry takes the file out of the run: it is never analysed and
+never counted, but it stays on the checklist, marked as ignored, so the decision
+stays visible. Files missing on disk or generated are skipped the same way, decided
+afresh on every run rather than recorded.
 
 The model analyses one file per call and returns structured recon only. This script
-owns the database and renders the checklist.
+owns the recon files and renders the checklist.
 
 Press 'q' at any time to stop after the current file finishes. Creating the file
 governance/security-audit/scan/STOP has the same effect, for non-interactive runs.
@@ -66,10 +68,10 @@ if ([string]::IsNullOrEmpty($RepoRoot))
     { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path }   # governance/security-audit -> repository root
 if ([string]::IsNullOrEmpty($ModelScript))
     { $ModelScript = Join-Path $PSScriptRoot 'model-seam-claude.ps1' }
-if ([string]::IsNullOrEmpty($DatabasePath))
-    { $DatabasePath = Join-Path $PSScriptRoot 'podofo-recon-plan.json' }
 if ([string]::IsNullOrEmpty($ScanRoot))
     { $ScanRoot = Join-Path $PSScriptRoot 'scan' }
+if ([string]::IsNullOrEmpty($DatabasePath))
+    { $DatabasePath = Join-Path $ScanRoot 'podofo-recon-plan.json' }
 
 $targetsRoot = Join-Path $ScanRoot 'targets'
 $stopFile = Join-Path $ScanRoot 'STOP'
@@ -100,9 +102,9 @@ function Read-Database
     if (@($db.tiers).Count -eq 0)
         { throw "No tiers in $DatabasePath" }
 
-    # A file may be written as a bare path string, which means exactly a pending,
-    # non-ignored entry. Everything downstream holds a live reference into the tier,
-    # so the expansion has to happen here, once, before Get-Entries reads it.
+    # A file may be written as a bare path string, which means exactly a non-ignored
+    # entry with no description. Expanded here, once, so everything downstream sees
+    # one shape.
     foreach ($tier in $db.tiers)
     {
         $tier.files = @(foreach ($file in $tier.files)
@@ -114,49 +116,6 @@ function Read-Database
     return $db
 }
 
-# Absent means null, and absent "done" means false, so a field is written only when
-# it carries a value. An entry that carries nothing but a path is written back as the
-# bare string it may have been typed as, which keeps a hand-edited list readable.
-function Save-Database
-{
-    param([Parameter(Mandatory)][psobject]$Database)
-
-    $tiers = foreach ($tier in $Database.tiers)
-    {
-        $files = foreach ($file in $tier.files)
-        {
-            $entry = [ordered]@{ path = $file.path }
-            if (Test-FileIgnored -File $file)
-                { $entry.ignore = $true }
-
-            if (Test-FileDone -File $file)
-                { $entry.done = $true }
-
-            foreach ($name in @('description', 'result'))
-            {
-                $value = Get-Field -Object $file -Name $name
-                if (-not [string]::IsNullOrEmpty($value))
-                    { $entry[$name] = $value }
-            }
-
-            if ($entry.Count -eq 1) { $file.path } else { $entry }
-        }
-
-        [ordered]@{ tier = $tier.tier; description = $tier.description; files = @($files) }
-    }
-
-    Write-FileAtomic -Path $DatabasePath -Content (
-        [ordered]@{ version = $Database.version; tiers = @($tiers) } | ConvertTo-Json -Depth 8)
-}
-
-# Absent means false: an entry is pending until something marks it done.
-function Test-FileDone
-{
-    param([Parameter(Mandatory)][psobject]$File)
-
-    return [bool](Get-Field -Object $File -Name 'done')
-}
-
 # Absent means false. An ignored file is never analysed and never counted, but it
 # stays in the database and on the checklist so the decision remains visible.
 function Test-FileIgnored
@@ -166,8 +125,47 @@ function Test-FileIgnored
     return [bool](Get-Field -Object $File -Name 'ignore')
 }
 
-# Flat iteration order over the tiers. Each row holds a live reference to the file
-# object inside the database, so updating a row and saving the database is enough.
+# The recon a previous pass wrote for this file, or $null when it has not been
+# analysed. Its existence is what marks the file done. The origin check catches two
+# plan paths that flatten to the same scan folder, which would otherwise have one
+# file's recon stand in for, and then be overwritten by, the other's.
+function Read-ReconRecord
+{
+    param([Parameter(Mandatory)][string]$RelativePath)
+
+    $path = Join-Path (Join-Path $targetsRoot (Get-ScanFileKey $RelativePath)) 'recon.json'
+    if (-not (Test-Path -LiteralPath $path))
+        { return $null }
+
+    $record = Get-Content -LiteralPath $path -Raw -Encoding utf8 | ConvertFrom-Json
+    if ($record.origin_file -ne $RelativePath)
+        { throw "$path was written for $($record.origin_file), not $RelativePath. Both map to the same scan folder." }
+
+    return $record
+}
+
+# Why a file cannot be analysed as it stands, or $null when it can. Cheap enough to
+# decide on every run, so it is never recorded and a file that comes back is picked up.
+function Get-SkipReason
+{
+    param([Parameter(Mandatory)][string]$RelativePath)
+
+    $fullPath = Join-Path $RepoRoot $RelativePath
+    if (-not (Test-Path -LiteralPath $fullPath))
+        { return 'missing on disk' }
+
+    $header = (Get-Content -LiteralPath $fullPath -TotalCount 5) -join "`n"
+    if ($header -match 'was generated\. DO NOT EDIT')
+    {
+        $lineCount = (Get-Content -LiteralPath $fullPath | Measure-Object -Line).Lines
+        return "generated, $lineCount lines"
+    }
+
+    return $null
+}
+
+# Flat iteration order over the tiers. Recon and Skip are derived from disk here and
+# live only in memory; nothing about a run is written back to the database.
 function Get-Entries
 {
     param([Parameter(Mandatory)][psobject]$Database)
@@ -177,15 +175,35 @@ function Get-Entries
     {
         foreach ($file in $tier.files)
         {
+            $ignored = Test-FileIgnored -File $file
             $entries.Add([pscustomobject]@{
                 Tier            = $tier.tier
                 TierDescription = $tier.description
                 File            = $file
+                Recon           = if ($ignored) { $null } else { Read-ReconRecord -RelativePath $file.path }
+                Skip            = if ($ignored) { $null } else { Get-SkipReason -RelativePath $file.path }
             })
         }
     }
 
     return $entries
+}
+
+# Ignored is the plan's own decision, done means a recon exists, skipped is a file
+# that cannot be analysed as it stands. A recon outranks a skip: it is still the
+# result of that file even if the file has since gone.
+function Get-EntryState
+{
+    param([Parameter(Mandatory)][psobject]$Entry)
+
+    if (Test-FileIgnored -File $Entry.File)
+        { return 'ignored' }
+    if ($null -ne $Entry.Recon)
+        { return 'done' }
+    if ($null -ne $Entry.Skip)
+        { return 'skipped' }
+
+    return 'pending'
 }
 
 #endregion
@@ -198,10 +216,13 @@ function Get-EntryStatusText
 
     if ($Current)
         { return 'analysing...' }
-    if (Test-FileIgnored -File $Entry.File)
-        { return 'ignored' }
-    if (Test-FileDone -File $Entry.File)
-        { return (Get-Field -Object $Entry.File -Name 'result') }
+
+    switch (Get-EntryState -Entry $Entry)
+    {
+        'ignored' { return 'ignored' }
+        'done'    { return (Format-ResultAnnotation -Recon $Entry.Recon.recon) }
+        'skipped' { return "skipped ($($Entry.Skip))" }
+    }
 
     $description = Get-Field -Object $Entry.File -Name 'description'
     if (-not [string]::IsNullOrEmpty($description))
@@ -216,18 +237,15 @@ function Get-EntryColor
 
     if ($Current)
         { return $palette.Current }
-    if (Test-FileIgnored -File $Entry.File)
-        { return $palette.Muted }
-    if (-not (Test-FileDone -File $Entry.File))
+    if ((Get-EntryState -Entry $Entry) -ne 'done')
         { return $palette.Muted }
 
-    switch -Regex ([string](Get-Field -Object $Entry.File -Name 'result'))
+    switch ([string]$Entry.Recon.recon.audit_priority)
     {
-        '^high'    { return $palette.High }
-        '^medium'  { return $palette.Medium }
-        '^low'     { return $palette.Low }
-        '^skipped' { return $palette.Muted }
-        default    { return $palette.Hint }
+        'high'   { return $palette.High }
+        'medium' { return $palette.Medium }
+        'low'    { return $palette.Low }
+        default  { return $palette.Hint }
     }
 }
 
@@ -261,9 +279,15 @@ function Show-Checklist
 
         $isCurrent = ($i -eq $CurrentIndex)
         $mark = if ($isCurrent) { '>' }
-            elseif (Test-FileIgnored -File $entry.File) { '-' }
-            elseif (Test-FileDone -File $entry.File) { 'x' }
-            else { ' ' }
+            else
+            {
+                switch (Get-EntryState -Entry $entry)
+                {
+                    'done'    { 'x' }
+                    'pending' { ' ' }
+                    default   { '-' }
+                }
+            }
         $text = '  [{0}] {1}  {2}' -f $mark,
             ([System.IO.Path]::GetFileName($entry.File.path).PadRight($nameWidth)),
             (Get-EntryStatusText -Entry $entry -Current:$isCurrent)
@@ -274,16 +298,22 @@ function Show-Checklist
         $rows.Add([pscustomobject]@{ Text = $text.TrimEnd(); Color = (Get-EntryColor -Entry $entry -Current:$isCurrent) })
     }
 
-    # Ignored files are shown but not counted, so the ratio tracks the real work.
-    $active = @($Entries | Where-Object { -not (Test-FileIgnored -File $_.File) })
-    $done = @($active | Where-Object { Test-FileDone -File $_.File }).Count
-    $ignored = $Entries.Count - $active.Count
-    $skipped = if ($ignored -gt 0) { "   $ignored ignored" } else { '' }
+    # Ignored and skipped files are shown but not counted, so the ratio tracks the
+    # real work.
+    $states = @($Entries | ForEach-Object { Get-EntryState -Entry $_ })
+    $done = @($states | Where-Object { $_ -eq 'done' }).Count
+    $counted = $done + @($states | Where-Object { $_ -eq 'pending' }).Count
+    $aside = @(foreach ($state in @('ignored', 'skipped'))
+    {
+        $count = @($states | Where-Object { $_ -eq $state }).Count
+        if ($count -gt 0) { "$count $state" }
+    })
+    $setAside = if ($aside.Count -gt 0) { '   ' + ($aside -join ', ') } else { '' }
     $elapsed = (Get-Date) - $StartedAt
     $rate = if ($AnalysedThisRun -gt 0) { ' | {0:n0}s/file' -f ($elapsed.TotalSeconds / $AnalysedThisRun) } else { '' }
 
     try { Clear-Host } catch { }
-    Write-Host ('PoDoFo recon   {0}/{1} analysed{2}   {3:hh\:mm\:ss} elapsed{4}' -f $done, $active.Count, $skipped, $elapsed, $rate) -ForegroundColor $palette.Header
+    Write-Host ('PoDoFo recon   {0}/{1} analysed{2}   {3:hh\:mm\:ss} elapsed{4}' -f $done, $counted, $setAside, $elapsed, $rate) -ForegroundColor $palette.Header
 
     # The tier header can scroll out of the viewport, so keep it on the status line.
     if ($CurrentIndex -ge 0)
@@ -308,7 +338,7 @@ function Write-EntryResult
     )
 
     Write-Host ('[{0,4}/{1}] T{2,-2} {3,-42} {4}' -f ($Index + 1), $Total, $Entry.Tier,
-        [System.IO.Path]::GetFileName($Entry.File.path), (Get-Field -Object $Entry.File -Name 'result'))
+        [System.IO.Path]::GetFileName($Entry.File.path), (Get-EntryStatusText -Entry $Entry))
 }
 
 # Non-interactive runs cannot poll for a keypress, so telling them to press q would
@@ -379,7 +409,7 @@ function Update-StopRequest
         { return $false }
 
     Write-Host ''
-    Write-Host '  Stop requested. Saving the current file; no further files will be started.' -ForegroundColor $palette.Warning
+    Write-Host '  Stop requested. The current file will finish; no further files will be started.' -ForegroundColor $palette.Warning
     return $true
 }
 
@@ -498,8 +528,6 @@ function Save-Recon
     )
 
     $targetDir = Join-Path $targetsRoot (Get-ScanFileKey $Entry.File.path)
-    if (-not (Test-Path $targetDir))
-        { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
 
     # Rebuilt rather than annotated in place, so the id leads each target object.
     $targets = foreach ($target in @($Recon.proposed_targets))
@@ -546,12 +574,13 @@ function Format-ResultAnnotation
 $db = Read-Database
 $entries = @(Get-Entries -Database $db)
 
-# Ignored files stay in $entries so the checklist still shows them, but they are not
-# work and they are not part of the total the run reports against.
-$active = @($entries | Where-Object { -not (Test-FileIgnored -File $_.File) })
+# Ignored and skipped files stay in $entries so the checklist still shows them, but
+# they are not work and they are not part of the total the run reports against.
+$active = @($entries | Where-Object { (Get-EntryState -Entry $_) -in @('done', 'pending') })
 $total = $active.Count
 
-$pending = @($active | Where-Object { $Redo -or -not (Test-FileDone -File $_.File) })
+# -Redo reaches files already done, but never one that cannot be analysed now.
+$pending = @($active | Where-Object { $null -eq $_.Skip -and ($Redo -or (Get-EntryState -Entry $_) -eq 'pending') })
 if (-not [string]::IsNullOrEmpty($Only))
     { $pending = @($pending | Where-Object { $_.File.path -match $Only }) }
 
@@ -603,76 +632,62 @@ foreach ($entry in $pending)
         { Show-Checklist -Entries $entries -CurrentIndex $index -StartedAt $startedAt -AnalysedThisRun $analysed }
 
     $fullPath = Join-Path $RepoRoot $entry.File.path
-    if (-not (Test-Path $fullPath))
+    $lineCount = (Get-Content -LiteralPath $fullPath | Measure-Object -Line).Lines
+
+    # Numbered against the files that are actually being analysed, so the prompt's
+    # "file n of m" matches what the run reports.
+    $prompt = New-ReconPrompt -Entry $entry -LineCount $lineCount -Index ([array]::IndexOf($active, $entry) + 1) -Total $total
+    $transcript = Join-Path $runsRoot ('{0}.log' -f (Get-ScanFileKey $entry.File.path))
+    $transcriptState = Start-RunTranscript -Transcript $transcript -Header "recon | $($entry.File.path)" -Effort $Effort
+    $ticker = New-ActivityTicker -Color $palette.Current -Hint $runHint -Signal $keySignal `
+        -MonitorPath $transcript -RawLog $rawLog -Transcript $transcript -TranscriptState $transcriptState `
+        -Text ("Analysing {0} ({1} lines)..." -f [System.IO.Path]::GetFileName($entry.File.path), $lineCount)
+    try
     {
-        Set-Field -Object $entry.File -Name 'result' -Value 'skipped (missing on disk)'
+        $recon = Invoke-ModelPrompt -Prompt $prompt -Schema $reconSchema -Model $Model -Effort $Effort `
+            -Label "recon:$($entry.File.path)" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
     }
-    else
+    catch
     {
-        $lineCount = (Get-Content -LiteralPath $fullPath | Measure-Object -Line).Lines
-        $header = (Get-Content -LiteralPath $fullPath -TotalCount 5) -join "`n"
-        if ($header -match 'was generated\. DO NOT EDIT')
-        {
-            Set-Field -Object $entry.File -Name 'result' -Value "skipped (generated, $lineCount lines)"
-        }
-        else
-        {
-            # Numbered against the files that are actually being analysed, so the
-            # prompt's "file n of m" matches what the run reports.
-            $prompt = New-ReconPrompt -Entry $entry -LineCount $lineCount -Index ([array]::IndexOf($active, $entry) + 1) -Total $total
-            $transcript = Join-Path $runsRoot ('{0}.log' -f (Get-ScanFileKey $entry.File.path))
-            $transcriptState = Start-RunTranscript -Transcript $transcript -Header "recon | $($entry.File.path)" -Effort $Effort
-            $ticker = New-ActivityTicker -Color $palette.Current -Hint $runHint -Signal $keySignal `
-                -MonitorPath $transcript -RawLog $rawLog -Transcript $transcript -TranscriptState $transcriptState `
-                -Text ("Analysing {0} ({1} lines)..." -f [System.IO.Path]::GetFileName($entry.File.path), $lineCount)
-            try
-            {
-                $recon = Invoke-ModelPrompt -Prompt $prompt -Schema $reconSchema -Model $Model -Effort $Effort `
-                    -Label "recon:$($entry.File.path)" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
-            }
-            catch
-            {
-                # A drained subscription window is a pause, not a failure. The file
-                # is left pending and untouched, so a run started after the reset
-                # picks it up again here; anything else is a real error and stands.
-                if (-not (Test-RateLimitError -ErrorRecord $_))
-                    { throw }
+        # A drained subscription window is a pause, not a failure. No recon is
+        # written, so the file is still pending and a run started after the reset
+        # picks it up again here; anything else is a real error and stands.
+        if (-not (Test-RateLimitError -ErrorRecord $_))
+            { throw }
 
-                Update-RunTranscript -RawLog $rawLog -Transcript $transcript -State $transcriptState
-                $limitMessage = $_.Exception.Message
-                break
-            }
-
-            Update-RunTranscript -RawLog $rawLog -Transcript $transcript -State $transcriptState
-
-            # The log has just gained this call's closing figures, so the next file
-            # starts its status row current rather than a cache interval behind.
-            Update-UsageStatus -RawLog $rawLog
-
-            if ($recon -is [string])
-            {
-                $text = $recon.Trim()
-                if ($text -match '(?s)^```(?:json)?\s*(?<body>.*?)\s*```$')
-                    { $text = $Matches['body'] }
-
-                $recon = $text | ConvertFrom-Json
-            }
-
-            Save-Recon -Entry $entry -Recon $recon
-            Set-Field -Object $entry.File -Name 'result' -Value (Format-ResultAnnotation -Recon $recon)
-            $analysed++
-        }
+        Update-RunTranscript -RawLog $rawLog -Transcript $transcript -State $transcriptState
+        $limitMessage = $_.Exception.Message
+        break
     }
+
+    Update-RunTranscript -RawLog $rawLog -Transcript $transcript -State $transcriptState
+
+    # The log has just gained this call's closing figures, so the next file starts
+    # its status row current rather than a cache interval behind.
+    Update-UsageStatus -RawLog $rawLog
+
+    if ($recon -is [string])
+    {
+        $text = $recon.Trim()
+        if ($text -match '(?s)^```(?:json)?\s*(?<body>.*?)\s*```$')
+            { $text = $Matches['body'] }
+
+        $recon = $text | ConvertFrom-Json
+    }
+
+    # Writing the recon is what marks the file done. Read back rather than kept from
+    # the call, so the checklist shows exactly what a later run will find on disk.
+    Save-Recon -Entry $entry -Recon $recon
+    $entry.Recon = Read-ReconRecord -RelativePath $entry.File.path
+    $analysed++
 
     # Poll again here so a q pressed during the model call is acknowledged as soon as
     # the call returns, rather than silently at the top of the next iteration.
     $stopRequested = Update-StopRequest -Current $stopRequested
 
-    Set-Field -Object $entry.File -Name 'done' -Value $true
-    Save-Database -Database $db
     if (-not $interactive)
     {
-        Write-EntryResult -Entry $entry -Index $index -Total $total
+        Write-EntryResult -Entry $entry -Index ([array]::IndexOf($active, $entry)) -Total $total
         Write-StopHint -Interactive $interactive -Terse
     }
 }
