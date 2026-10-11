@@ -324,78 +324,198 @@ function Start-RunMonitor
     return $true
 }
 
-# Long tool arguments and absolute paths make the transcript unreadable, so values
-# are shortened the way a session view shows them.
-function Format-ToolInput
+# The transcript is the only lasting record of a call: the raw stream is overwritten
+# by the next one. So nothing the model produced is shortened here, only laid out;
+# the one exception is what read-like tools showed it, see Format-ToolResult. Parsed JSON values are laid out the way YAML would, one entry
+# per line with strings keeping their own line breaks, which reads far better than
+# escaped JSON for the prose the structured answers are made of.
+function Format-LogEntry
 {
-    param($InputObject)
+    param([string]$Prefix, $Value, [string]$Indent)
 
-    if ($null -eq $InputObject)
-        { return '' }
+    $child = $Indent + '    '
 
-    $parts = @()
-    foreach ($property in $InputObject.PSObject.Properties)
+    if ($Value -is [System.Management.Automation.PSCustomObject])
     {
-        $value = [string]$property.Value
-        $value = $value -replace '\r?\n', ' '
-        $value = $value -replace '^.*[\\/](src[\\/])', '$1'
-        if ($value.Length -gt 70)
-            { $value = $value.Substring(0, 67) + '...' }
+        if (@($Value.PSObject.Properties).Count -eq 0)
+            { return @($Prefix + '{}') }
 
-        $parts += ('{0}={1}' -f $property.Name, $value)
+        return @($Prefix.TrimEnd()) + @(Format-LogProperties -Object $Value -Indent $child)
     }
 
-    return ($parts -join ', ')
-}
+    if ($Value -is [array])
+    {
+        if ($Value.Count -eq 0)
+            { return @($Prefix + '[]') }
 
-function Format-ToolResult
-{
-    param($Block, [string]$ToolName, [int]$MaxLines = 10)
+        $lines = @($Prefix.TrimEnd())
+        foreach ($item in $Value)
+        {
+            if ($item -is [System.Management.Automation.PSCustomObject] -and @($item.PSObject.Properties).Count -gt 0)
+            {
+                # An object in a list opens on the dash line, its first entry beside it.
+                $entries = @(Format-LogProperties -Object $item -Indent "$child  ")
+                $entries[0] = "$child- " + $entries[0].Substring($child.Length + 2)
+                $lines += $entries
+            }
+            else
+                { $lines += Format-LogEntry -Prefix "$child- " -Value $item -Indent "$child  " }
+        }
 
-    # Tool calls are often issued in parallel, so both requests print before either
-    # result. Naming the tool on the result line keeps the pairing readable.
-    $tag = if ([string]::IsNullOrEmpty($ToolName)) { '    -> ' } else { "    -> [$ToolName] " }
-    $pad = ' ' * $tag.Length
+        return $lines
+    }
 
-    $content = $Block.content
-    $text = if ($content -is [string]) { $content }
-        else { (@($content) | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }
-
-    if ([string]::IsNullOrWhiteSpace($text))
-        { return @($tag + '(no output)') }
-
-    $all = $text -split '\r?\n'
-    $shown = @($all | Select-Object -First $MaxLines)
-    $lines = @($tag + $shown[0])
-    foreach ($line in $shown | Select-Object -Skip 1)
-        { $lines += $pad + $line }
-
-    if ($all.Count -gt $MaxLines)
-        { $lines += ($pad + ('... {0} more line(s)' -f ($all.Count - $MaxLines))) }
+    $text = if ($null -eq $Value) { 'null' } else { [string]$Value }
+    $parts = @($text -split '\r?\n')
+    $lines = @(($Prefix + $parts[0]).TrimEnd())
+    foreach ($part in $parts | Select-Object -Skip 1)
+        { $lines += ($child + $part).TrimEnd() }
 
     return $lines
 }
 
-# One streamed event becomes zero or more transcript lines. Anything not worth
-# reading (rate limit notices, bookkeeping) yields nothing.
+function Format-LogProperties
+{
+    param([Parameter(Mandatory)][psobject]$Object, [string]$Indent)
+
+    $lines = @()
+    foreach ($property in $Object.PSObject.Properties)
+        { $lines += Format-LogEntry -Prefix "$Indent$($property.Name): " -Value $property.Value -Indent $Indent }
+
+    return $lines
+}
+
+# Short scalar arguments stay on the call line, the way a session view shows them;
+# anything long, multi-line or nested is laid out below it, one argument per line.
+function Format-ToolCall
+{
+    param([Parameter(Mandatory)][string]$Name, $InputObject)
+
+    $properties = if ($null -eq $InputObject) { @() } else { @($InputObject.PSObject.Properties) }
+
+    $inline = @()
+    foreach ($property in $properties)
+    {
+        $value = $property.Value
+        if ($value -is [array] -or $value -is [System.Management.Automation.PSCustomObject] -or
+            ([string]$value) -match '[\r\n]')
+            { $inline = $null; break }
+
+        $inline += ('{0}={1}' -f $property.Name, $value)
+    }
+
+    if ($null -ne $inline)
+    {
+        $line = '* {0}({1})' -f $Name, ($inline -join ', ')
+        if ($line.Length -le 160)
+            { return @($line) }
+    }
+
+    return @("* $Name") + @(Format-LogProperties -Object $InputObject -Indent '    ')
+}
+
+# A content part the formatter has no layout for is still logged, as compact JSON.
+function Format-UnknownPart
+{
+    param([string]$Kind, [Parameter(Mandatory)][psobject]$Part)
+
+    return ('[{0}] {1}' -f $Kind, ($Part | ConvertTo-Json -Depth 32 -Compress))
+}
+
+# Read-like tools return what is still on disk or on the web, so only the first lines
+# of their results are kept, enough to show what came back. Every other result, a
+# subagent's report above all, is logged whole. Binary payloads are described rather
+# than copied: base64 image data says nothing in a log.
+function Format-ToolResult
+{
+    param($Block, [string]$ToolName, [int]$MaxReadLines = 10)
+
+    $readLikeTools = @('Read', 'Grep', 'Glob', 'LS', 'NotebookRead', 'WebFetch', 'WebSearch', 'ToolSearch')
+
+    $label = $ToolName
+    if ($true -eq (Get-Field -Object $Block -Name 'is_error'))
+        { $label = if ([string]::IsNullOrEmpty($label)) { 'error' } else { "$label, error" } }
+
+    # Tool calls are often issued in parallel, so both requests print before either
+    # result. Naming the tool on the result line keeps the pairing readable.
+    $tag = if ([string]::IsNullOrEmpty($label)) { '    -> ' } else { "    -> [$label] " }
+    $pad = ' ' * $tag.Length
+
+    $content = Get-Field -Object $Block -Name 'content'
+    $texts = @()
+    foreach ($part in @($content))
+    {
+        if ($null -eq $part)
+            { continue }
+
+        if ($part -is [string])
+            { $texts += $part; continue }
+
+        $kind = [string](Get-Field -Object $part -Name 'type')
+        if ($kind -eq 'text')
+            { $texts += [string](Get-Field -Object $part -Name 'text') }
+        elseif ($kind -eq 'image')
+        {
+            $source = Get-Field -Object $part -Name 'source'
+            $mediaType = if ($null -ne $source) { Get-Field -Object $source -Name 'media_type' } else { $null }
+            $data = if ($null -ne $source) { [string](Get-Field -Object $source -Name 'data') } else { '' }
+            $texts += ('[image {0}, {1} base64 characters not logged]' -f $mediaType, $data.Length)
+        }
+        else
+            { $texts += Format-UnknownPart -Kind $kind -Part $part }
+    }
+
+    $text = $texts -join "`n"
+    if ([string]::IsNullOrWhiteSpace($text))
+        { return @($tag + '(no output)') }
+
+    $all = @($text -split '\r?\n')
+    $shown = if ($ToolName -in $readLikeTools) { @($all | Select-Object -First $MaxReadLines) } else { $all }
+
+    $lines = @($tag + $shown[0])
+    foreach ($line in $shown | Select-Object -Skip 1)
+        { $lines += $pad + $line }
+
+    if ($all.Count -gt $shown.Count)
+        { $lines += ($pad + ('... {0} more line(s)' -f ($all.Count - $shown.Count))) }
+
+    return $lines
+}
+
+# One streamed event becomes zero or more transcript lines. Only bookkeeping yields
+# nothing: rate limit notices, read elsewhere for the status row, and the running
+# thinking estimates, which are folded into the thinking block they lead up to.
+# An event of a kind not known here is logged as compact JSON rather than dropped.
 function Format-RunEvent
 {
-    param([Parameter(Mandatory)][psobject]$Record, [hashtable]$ToolNames, [string]$Effort)
+    param([Parameter(Mandatory)][psobject]$Record, [Parameter(Mandatory)][hashtable]$State)
 
-    switch ($Record.type)
+    $type = [string](Get-Field -Object $Record -Name 'type')
+    switch ($type)
     {
         'system'
         {
-            if ($Record.subtype -ne 'init')
-                { return @() }
+            $subtype = [string](Get-Field -Object $Record -Name 'subtype')
+            if ($subtype -eq 'init')
+            {
+                # The init event carries the model but not the reasoning level, so the
+                # effort the caller asked for is threaded in through the transcript state.
+                $model = "model $($Record.model)"
+                if (-not [string]::IsNullOrEmpty($State.Effort))
+                    { $model += " | effort $($State.Effort)" }
 
-            # The init event carries the model but not the reasoning level, so the
-            # effort the caller asked for is threaded in through the transcript state.
-            $model = "model $($Record.model)"
-            if (-not [string]::IsNullOrEmpty($Effort))
-                { $model += " | effort $Effort" }
+                return @($model, "session $($Record.session_id)", '')
+            }
 
-            return @($model, "session $($Record.session_id)", '')
+            # The estimate is cumulative within one thinking block.
+            if ($subtype -eq 'thinking_tokens')
+            {
+                $State.ThinkingTokens = Get-Field -Object $Record -Name 'estimated_tokens'
+                return @()
+            }
+
+            $rest = $Record | Select-Object -Property * -ExcludeProperty 'type', 'subtype', 'session_id', 'uuid'
+            return @(('[system {0}] {1}' -f $subtype, ($rest | ConvertTo-Json -Depth 32 -Compress)), '')
         }
 
         'assistant'
@@ -403,15 +523,48 @@ function Format-RunEvent
             $lines = @()
             foreach ($block in @($Record.message.content))
             {
-                if ($block.type -eq 'text' -and -not [string]::IsNullOrWhiteSpace($block.text))
-                    { $lines += @($block.text.TrimEnd(), '') }
-                elseif ($block.type -eq 'tool_use')
-                {
-                    if ($null -ne $ToolNames)
-                        { $ToolNames[[string]$block.id] = [string]$block.name }
+                if ($block -is [string])
+                    { $block = [pscustomobject]@{ type = 'text'; text = $block } }
 
-                    $lines += ('* {0}({1})' -f $block.name, (Format-ToolInput $block.input))
+                $kind = [string](Get-Field -Object $block -Name 'type')
+                if ($kind -eq 'text')
+                {
+                    $text = [string](Get-Field -Object $block -Name 'text')
+                    if (-not [string]::IsNullOrWhiteSpace($text))
+                        { $lines += @($text.TrimEnd(), '') }
                 }
+                elseif ($kind -eq 'thinking' -or $kind -eq 'redacted_thinking')
+                {
+                    # The reasoning itself comes back stripped, leaving only an encrypted
+                    # signature; some blocks carry a short summary in its place.
+                    $notes = @()
+                    if ($null -ne $State.ThinkingTokens)
+                        { $notes += ('~{0} tokens' -f $State.ThinkingTokens) }
+
+                    $State.ThinkingTokens = $null
+
+                    $text = if ($kind -eq 'thinking') { [string](Get-Field -Object $block -Name 'thinking') } else { '' }
+                    if ($kind -eq 'redacted_thinking')
+                        { $notes += 'redacted' }
+                    elseif ([string]::IsNullOrWhiteSpace($text))
+                        { $notes += 'no text returned' }
+
+                    $lines += ('~ thinking ({0})' -f ($notes -join ', '))
+                    if (-not [string]::IsNullOrWhiteSpace($text))
+                    {
+                        foreach ($line in $text.Trim() -split '\r?\n')
+                            { $lines += ('  ' + $line).TrimEnd() }
+                    }
+
+                    $lines += ''
+                }
+                elseif ($kind -eq 'tool_use')
+                {
+                    $State.ToolNames[[string]$block.id] = [string]$block.name
+                    $lines += Format-ToolCall -Name ([string]$block.name) -InputObject (Get-Field -Object $block -Name 'input')
+                }
+                else
+                    { $lines += @((Format-UnknownPart -Kind $kind -Part $block), '') }
             }
 
             return $lines
@@ -422,17 +575,32 @@ function Format-RunEvent
             $lines = @()
             foreach ($block in @($Record.message.content))
             {
-                if ($block.type -eq 'tool_result')
+                if ($block -is [string])
+                    { $block = [pscustomobject]@{ type = 'text'; text = $block } }
+
+                $kind = [string](Get-Field -Object $block -Name 'type')
+                if ($kind -eq 'tool_result')
                 {
                     $name = ''
                     $id = [string](Get-Field -Object $block -Name 'tool_use_id')
-                    if ($null -ne $ToolNames -and -not [string]::IsNullOrEmpty($id) -and $ToolNames.ContainsKey($id))
-                        { $name = $ToolNames[$id] }
+                    if (-not [string]::IsNullOrEmpty($id) -and $State.ToolNames.ContainsKey($id))
+                        { $name = $State.ToolNames[$id] }
 
                     $lines += (Format-ToolResult -Block $block -ToolName $name) + @('')
                 }
-                elseif ($block.type -eq 'text' -and -not [string]::IsNullOrWhiteSpace($block.text))
-                    { $lines += @('> ' + ($block.text -split '\r?\n')[0], '') }
+                elseif ($kind -eq 'text')
+                {
+                    $text = [string](Get-Field -Object $block -Name 'text')
+                    if (-not [string]::IsNullOrWhiteSpace($text))
+                    {
+                        foreach ($line in $text.TrimEnd() -split '\r?\n')
+                            { $lines += ('> ' + $line).TrimEnd() }
+
+                        $lines += ''
+                    }
+                }
+                else
+                    { $lines += @((Format-UnknownPart -Kind $kind -Part $block), '') }
             }
 
             return $lines
@@ -440,12 +608,55 @@ function Format-RunEvent
 
         'result'
         {
-            return @('', ('=== {0} | {1} turn(s) | {2:n4} USD | {3:n1}s ===' -f
-                $Record.subtype, $Record.num_turns, $Record.total_cost_usd, ($Record.duration_ms / 1000)))
+            $lines = @('')
+
+            # On success the result text is the structured answer, already logged as
+            # the StructuredOutput call. On failure it is the reason.
+            $subtype = [string](Get-Field -Object $Record -Name 'subtype')
+            if ($subtype -ne 'success' -or $true -eq (Get-Field -Object $Record -Name 'is_error'))
+            {
+                $message = [string](Get-Field -Object $Record -Name 'result')
+                foreach ($line in @($message -split '\r?\n') + @(Get-Field -Object $Record -Name 'errors'))
+                {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$line))
+                        { $lines += "! $line" }
+                }
+            }
+
+            $denials = Get-Field -Object $Record -Name 'permission_denials'
+            foreach ($denial in @($denials))
+            {
+                if ($null -ne $denial)
+                    { $lines += ('! permission denied: {0}' -f ($denial | ConvertTo-Json -Depth 32 -Compress)) }
+            }
+
+            $segments = @($subtype, ('{0} turn(s)' -f (Get-Field -Object $Record -Name 'num_turns')))
+
+            $usage = Get-Field -Object $Record -Name 'usage'
+            $outputTokens = if ($null -ne $usage) { Get-Field -Object $usage -Name 'output_tokens' } else { $null }
+            if ($null -ne $outputTokens)
+            {
+                $tokens = '{0} output tokens' -f $outputTokens
+                $details = Get-Field -Object $usage -Name 'output_tokens_details'
+                $thinking = if ($null -ne $details) { Get-Field -Object $details -Name 'thinking_tokens' } else { $null }
+                if ($null -ne $thinking)
+                    { $tokens += (', {0} thinking' -f $thinking) }
+
+                $segments += $tokens
+            }
+
+            $segments += ('{0:n4} USD' -f (Get-Field -Object $Record -Name 'total_cost_usd'))
+            $segments += ('{0:n1}s' -f ((Get-Field -Object $Record -Name 'duration_ms') / 1000))
+            $lines += ('=== {0} ===' -f ($segments -join ' | '))
+            return $lines
         }
+
+        'rate_limit_event'
+            { return @() }
     }
 
-    return @()
+    $rest = $Record | Select-Object -Property * -ExcludeProperty 'type', 'session_id', 'uuid'
+    return @(('[{0}] {1}' -f $type, ($rest | ConvertTo-Json -Depth 32 -Compress)), '')
 }
 
 # Converts whatever is new in the raw stream into readable text and appends it. The
@@ -507,9 +718,15 @@ function Update-RunTranscript
             { continue }
 
         try
-            { $new += Format-RunEvent -Record ($all[$i] | ConvertFrom-Json) -ToolNames $State.ToolNames -Effort $State.Effort }
+            { $record = $all[$i] | ConvertFrom-Json }
         catch
-            { }   # A half-written trailing line; it will be picked up next tick.
+            { continue }   # A half-written trailing line; it will be picked up next tick.
+
+        # A fault in the formatter must not cost the event, so it is logged as received.
+        try
+            { $new += Format-RunEvent -Record $record -State $State }
+        catch
+            { $new += @("[event not formatted: $($_.Exception.Message)]", $all[$i], '') }
     }
 
     # Only advance past lines that parsed, so a torn final line is retried.
@@ -549,7 +766,7 @@ function Start-RunTranscript
         { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
 
     Set-Content -LiteralPath $Transcript -Value @("=== $Header ===", '') -Encoding utf8
-    return @{ Offset = 0; ToolNames = @{}; Effort = $Effort }
+    return @{ Offset = 0; ToolNames = @{}; Effort = $Effort; ThinkingTokens = $null }
 }
 
 #endregion

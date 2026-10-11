@@ -126,7 +126,14 @@ two phases cannot drift apart:
   property of a `PSCustomObject`, so all optional database fields go through these
 - `Start-RunTranscript`, `Update-RunTranscript`, `Format-RunEvent` - turn the raw
   NDJSON event stream into readable chat text, appended incrementally while the call
-  is still running
+  is still running. The raw stream is overwritten by the next call, so the transcript
+  is the only lasting record and nothing the model produced is shortened: tool
+  arguments, the structured answer and tool results are logged whole, with nested
+  values laid out YAML-style. The exception is read-like tools (`Read`, `Grep`, `Glob`
+  and the like, listed in `Format-ToolResult`), whose results show what is still on disk
+  and are cut to their first ten lines. Base64 image data is described instead of
+  copied. An event the formatter does not know, or fails on, is logged as JSON rather
+  than dropped
 - `New-ActivityTicker` - the in-place spinner, and the only place keys pressed during
   a model call are noticed. It owns two rows, and reserves the second by emitting a
   line when it starts, which also absorbs the scroll when the cursor was on the last
@@ -187,8 +194,11 @@ Swapping in another provider means replacing only this file
 -RunLog -Model -Effort -MaxBudgetUsd`, and raising `PodofoRateLimitReached` for an
 exhausted quota if it wants the same clean stop.
 
-Note: the CLI returns thinking blocks with the text stripped (only the encrypted
-signature survives), so run transcripts cannot include model reasoning.
+Note: the CLI returns thinking blocks with the reasoning stripped. Only the encrypted
+signature survives, and some blocks carry a one- or two-sentence summary in its
+place. Transcripts log each block as a `~ thinking` line with the CLI's running token
+estimate, plus the summary when there is one; the reasoning itself cannot be
+recovered.
 
 ## Layout
 
