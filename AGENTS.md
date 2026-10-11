@@ -52,6 +52,12 @@ Reports land next to the recon that produced them, at
 finding, so it changes when validation revises it; the id is the stable handle, and
 report lookup globs `*<id>.md` so renames clean up after themselves.
 
+### `podofo-audit-status.ps1` - progress report
+
+Read-only. Prints the target queue as two tables: per priority by state, and per
+priority by recon confidence as pending/total, followed by how many pending targets
+the validator spawned. Safe to run alongside a live audit pass.
+
 ### Running them
 
 Both take `-Model` (default `claude-fable-5-1`), `-Effort` (`low` to `max`, default
@@ -156,6 +162,7 @@ governance/security-audit/
 ├── podofo-recon-plan.json     file work list and progress        (gitignored)
 ├── podofo-audit-targets.ps1   phase two driver
 ├── podofo-audit-targets.json  target queue and verdicts          (gitignored)
+├── podofo-audit-status.ps1    progress tables for the audit queue
 ├── audit-common.ps1           shared helpers
 ├── model-seam-claude.ps1      Invoke-ModelPrompt for Claude
 ├── .editorconfig              LF, UTF-8, 4-space indent
