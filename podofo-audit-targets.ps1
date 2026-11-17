@@ -20,7 +20,8 @@ are simply there.
 
 Each target then gets two model calls. The audit call looks for one candidate
 vulnerability; the validate call, a separate process that cannot see the auditor's
-reasoning, accepts or rejects it. The record is saved after each, so a run stopped in
+reasoning (the transcripts under scan/runs are denied to the model), accepts or
+rejects it. The record is saved after each, so a run stopped in
 between resumes at validation. The report at scan/targets/<file-key>/<slug>-<id>.md is
 rendered by this script from the record, not written by the model, which keeps the
 model read-only. Every run first renders again any report that does not match its
@@ -64,6 +65,8 @@ $PSNativeCommandUseErrorActionPreference = $true
 $ErrorActionPreference = 'stop'
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot 'audit-common.ps1')
+
 if ([string]::IsNullOrEmpty($RepoRoot))
     { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path }   # governance/security-audit -> repository root
 if ([string]::IsNullOrEmpty($ModelScript))
@@ -73,6 +76,15 @@ if ([string]::IsNullOrEmpty($ScanRoot))
 if ([string]::IsNullOrEmpty($DatabasePath))
     { $DatabasePath = Join-Path $ScanRoot 'podofo-audit-targets.json' }
 
+# Made absolute against the current location before anything uses them. Left
+# relative, each consumer would resolve them its own way - .NET against the process
+# directory, the CLI against the child's working directory - and the deny rules could
+# name a different directory from the one the transcripts are written to.
+$RepoRoot = Resolve-FullPath $RepoRoot
+$ModelScript = Resolve-FullPath $ModelScript
+$DatabasePath = Resolve-FullPath $DatabasePath
+$ScanRoot = Resolve-FullPath $ScanRoot
+
 $targetsRoot = Join-Path $ScanRoot 'targets'
 $stopFile = Join-Path $ScanRoot 'STOP'
 $runsRoot = Join-Path $ScanRoot 'runs/audit'
@@ -80,7 +92,7 @@ $runsRoot = Join-Path $ScanRoot 'runs/audit'
 # is what is kept and what 'm' opens.
 $rawLog = Join-Path $ScanRoot 'runs/audit-monitor.jsonl'
 
-. (Join-Path $PSScriptRoot 'audit-common.ps1')
+$deniedDirs = Get-DeniedDirs -ScriptRoot $PSScriptRoot -ScanRoot $ScanRoot
 
 if (Test-Path $ModelScript)
     { . $ModelScript }
@@ -898,6 +910,16 @@ if (-not [string]::IsNullOrEmpty($Id))
     { $work = @($work | Where-Object { $_.id -eq $Id }) }
 if (-not [string]::IsNullOrEmpty($MinPriority))
     { $work = @($work | Where-Object { $priorityRank[[string]$_.priority] -le $priorityRank[$MinPriority] }) }
+
+# The model cannot read a file in a denied directory, so a target there is left as it
+# is until the file or the denial moves, and does not count against -MaxTargets.
+$denied = @($work | Where-Object { Test-PathUnder -Path (Join-Path $RepoRoot $_.origin_file) -Directory $deniedDirs })
+if ($denied.Count -gt 0)
+{
+    Write-Host ('Skipping {0} target(s) whose file is in a denied directory.' -f $denied.Count) -ForegroundColor $palette.Warning
+    $work = @($work | Where-Object { $denied -notcontains $_ })
+}
+
 if ($MaxTargets -gt 0)
     { $work = @($work | Select-Object -First $MaxTargets) }
 
@@ -977,7 +999,8 @@ foreach ($target in $work)
         try
         {
             $audit = Invoke-ModelPrompt -Prompt (New-AuditPrompt -Target $target -Targets $targets) `
-                -Schema $auditSchema -Model $Model -Effort $Effort -Label "audit:$label" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+                -Schema $auditSchema -Model $Model -Effort $Effort -Label "audit:$label" -AllowDir $RepoRoot `
+                -DenyDir $deniedDirs -WorkDir $RepoRoot -OnWait $ticker -RunLog $rawLog
         }
         catch
         {
@@ -1024,7 +1047,8 @@ foreach ($target in $work)
     try
     {
         $validation = Invoke-ModelPrompt -Prompt (New-ValidatePrompt -Target $target -Targets $targets -ReportPath $reportPath) `
-            -Schema $validateSchema -Model $Model -Effort $Effort -Label "validate:$label" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+            -Schema $validateSchema -Model $Model -Effort $Effort -Label "validate:$label" -AllowDir $RepoRoot `
+            -DenyDir $deniedDirs -WorkDir $RepoRoot -OnWait $ticker -RunLog $rawLog
     }
     catch
     {

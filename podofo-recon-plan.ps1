@@ -15,8 +15,8 @@ checklist is read back from it. The pass resumes where it left off.
 A file entry may be written either as an object or as a bare path string. Setting
 "ignore": true on an entry takes the file out of the run: it is never analysed and
 never counted, but it stays on the checklist, marked as ignored, so the decision
-stays visible. Files missing on disk or generated are skipped the same way, decided
-afresh on every run rather than recorded.
+stays visible. Files missing on disk, generated, or in a directory denied to the model
+are skipped the same way, decided afresh on every run rather than recorded.
 
 The model analyses one file per call and returns structured recon only. This script
 owns the recon files and renders the checklist.
@@ -41,6 +41,8 @@ read access and schema-constrained output, not a plain completion:
             [hashtable]$Schema,
             [string]$Label,
             [string[]]$AllowDir,
+            [string[]]$DenyDir,
+            [string]$WorkDir,
             [string]$Effort
         )
         # returns a PSCustomObject (or JSON string) matching $Schema
@@ -64,6 +66,8 @@ $PSNativeCommandUseErrorActionPreference = $true
 $ErrorActionPreference = 'stop'
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot 'audit-common.ps1')
+
 if ([string]::IsNullOrEmpty($RepoRoot))
     { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path }   # governance/security-audit -> repository root
 if ([string]::IsNullOrEmpty($ModelScript))
@@ -73,6 +77,15 @@ if ([string]::IsNullOrEmpty($ScanRoot))
 if ([string]::IsNullOrEmpty($DatabasePath))
     { $DatabasePath = Join-Path $ScanRoot 'podofo-recon-plan.json' }
 
+# Made absolute against the current location before anything uses them. Left
+# relative, each consumer would resolve them its own way - .NET against the process
+# directory, the CLI against the child's working directory - and the deny rules could
+# name a different directory from the one the transcripts are written to.
+$RepoRoot = Resolve-FullPath $RepoRoot
+$ModelScript = Resolve-FullPath $ModelScript
+$DatabasePath = Resolve-FullPath $DatabasePath
+$ScanRoot = Resolve-FullPath $ScanRoot
+
 $targetsRoot = Join-Path $ScanRoot 'targets'
 $stopFile = Join-Path $ScanRoot 'STOP'
 $runsRoot = Join-Path $ScanRoot 'runs/recon'
@@ -80,7 +93,7 @@ $runsRoot = Join-Path $ScanRoot 'runs/recon'
 # is what is kept and what 'm' opens.
 $rawLog = Join-Path $ScanRoot 'runs/recon-monitor.jsonl'
 
-. (Join-Path $PSScriptRoot 'audit-common.ps1')
+$deniedDirs = Get-DeniedDirs -ScriptRoot $PSScriptRoot -ScanRoot $ScanRoot
 
 if (Test-Path $ModelScript)
     { . $ModelScript }
@@ -151,6 +164,11 @@ function Get-SkipReason
     param([Parameter(Mandatory)][string]$RelativePath)
 
     $fullPath = Join-Path $RepoRoot $RelativePath
+
+    # The model cannot read it, so a call would only burn a turn budget.
+    if (Test-PathUnder -Path $fullPath -Directory $deniedDirs)
+        { return 'denied directory' }
+
     if (-not (Test-Path -LiteralPath $fullPath))
         { return 'missing on disk' }
 
@@ -645,7 +663,8 @@ foreach ($entry in $pending)
     try
     {
         $recon = Invoke-ModelPrompt -Prompt $prompt -Schema $reconSchema -Model $Model -Effort $Effort `
-            -Label "recon:$($entry.File.path)" -AllowDir $RepoRoot -OnWait $ticker -RunLog $rawLog
+            -Label "recon:$($entry.File.path)" -AllowDir $RepoRoot -DenyDir $deniedDirs -WorkDir $RepoRoot `
+            -OnWait $ticker -RunLog $rawLog
     }
     catch
     {

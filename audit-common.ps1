@@ -265,6 +265,51 @@ function Get-AuditTargets
     return $targets
 }
 
+# Directories the model is denied, passed to the seam as -DenyDir. archive/ holds
+# backups, temporaries and earlier scans; scan/runs/ holds the transcripts, which
+# would otherwise let the validator read the auditor's reasoning.
+function Get-DeniedDirs
+{
+    param(
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [Parameter(Mandatory)][string]$ScanRoot
+    )
+
+    return @((Join-Path $ScriptRoot 'archive'), (Join-Path $ScanRoot 'runs'))
+}
+
+# Absolute and normalised, a relative path taken against the current PowerShell
+# location. GetFullPath alone resolves against the process directory, which
+# Set-Location does not move, so a relative -ScanRoot would name one directory to the
+# deny rules while the script writes its transcripts into another.
+function Resolve-FullPath
+{
+    param([Parameter(Mandatory)][string]$Path)
+
+    return [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path))
+}
+
+# True when Path is one of the directories or lies beneath one. Case-insensitive,
+# matching the file system the run is on.
+function Test-PathUnder
+{
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$Directory
+    )
+
+    $full = (Resolve-FullPath $Path).TrimEnd('\', '/')
+    foreach ($dir in $Directory)
+    {
+        $root = (Resolve-FullPath $dir).TrimEnd('\', '/')
+        if ($full.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $full.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase))
+            { return $true }
+    }
+
+    return $false
+}
+
 # Tuned for a light terminal background, so White, Yellow, Cyan, Green and Gray are
 # all avoided: they wash out on white. Set PODOFO_AUDIT_THEME=dark for the inverse.
 function Get-AuditPalette

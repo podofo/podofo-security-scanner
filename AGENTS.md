@@ -33,15 +33,16 @@ edited while a run is going. An entry in `files` is either an object or a bare p
 string; objects carry an optional `description` or `"ignore": true`. An ignored file
 is never analysed and never part of the count the run reports against, but it stays
 on the checklist marked `[-]`, so the decision stays visible rather than being lost by
-deleting the line. Files missing on disk or generated are skipped the same way,
-decided afresh on every run rather than recorded.
+deleting the line. Files missing on disk, generated, or in a denied directory are
+skipped the same way, decided afresh on every run rather than recorded.
 
 ### `podofo-audit-targets.ps1` - phase two, audit and validation
 
 Works the target queue in priority order. Each target gets two separate model
 calls: an audit that produces the report, then a validation that accepts or rejects
 it. They are separate processes so the validator structurally cannot see the
-auditor's reasoning.
+auditor's reasoning, and `scan/runs/` is denied to the model so it cannot read the
+auditor's transcript off disk either.
 
 Each kind of state has one home:
 
@@ -97,7 +98,10 @@ Both take `-Model` (default `claude-fable-5-1`), `-Effort` (`low` to `max`, defa
 `xhigh`), `-Only`, `-Redo` and `-DryRun`;
 the audit script adds `-Id`, `-MinPriority`, `-MaxTargets`, `-MaxSpendUsd`,
 `-SyncOnly` and `-RenderReports`. Paths (`-RepoRoot`, `-ScanRoot`, `-DatabasePath`, `-ModelScript`) all
-default relative to the script.
+default relative to the script. One passed as a relative path is made absolute
+against the current location before anything uses it: left relative, .NET would
+resolve it against the process directory, which `Set-Location` does not move, and the
+deny rules could name a different `scan/runs/` from the one the transcripts land in.
 
 The activity display is two rows: the spinner and the current item, then a status
 row with subscription usage and the key hints, e.g.
@@ -110,6 +114,17 @@ call's transcript in Notepad++ with `-monitor`. Creating `scan/STOP` has the sam
 effect as `q` for non-interactive runs. Running out of subscription quota stops a run
 the same way, reporting which window ran out and when it resets.
 
+### Denied directories
+
+`archive/` is the place for backups, temporaries and earlier scans. The model cannot
+read it, find files in it or get search matches from it, in any of the three calls.
+`scan/runs/` is denied the same way. Work whose file lies in a denied directory is not
+sent to a model that cannot read it, and nothing about it is recorded, so it comes
+back once the denial is lifted: recon shows the file as `skipped (denied directory)`,
+outside the count, and the audit pass reports how many targets it skipped and leaves
+them as they are. The list is `Get-DeniedDirs` in `audit-common.ps1`; enforcement is
+in the seam.
+
 ## Common infrastructure
 
 ### `audit-common.ps1`
@@ -120,6 +135,10 @@ two phases cannot drift apart:
 - `Get-ScanFileKey`, `Get-TargetId` - the path and target identity rules above
 - `Read-TargetRegistry`, `Read-AuditSources`, `Get-AuditTargets` - the audit target
   state derivation above, shared with the status script so the two cannot disagree
+- `Get-DeniedDirs`, `Test-PathUnder` - the directories denied to the model, and the
+  test the drivers use to skip work that lies inside one
+- `Resolve-FullPath` - an absolute path, a relative one taken against the current
+  PowerShell location rather than the process directory
 - `Write-FileAtomic` - write to a temp file, then `File.Move(..., overwrite)`, so
   Ctrl-C cannot leave a half-written database
 - `Get-Field` / `Set-Field` - StrictMode throws on both reading and writing an absent
@@ -170,10 +189,49 @@ Defines `Invoke-ModelPrompt` on top of the Claude Code CLI. Recon and audit both
 source, so this has to be an agent invocation, not a plain completion.
 
 Read-only is enforced by the harness rather than by asking the prompt nicely:
-`--restricted` drops the shell tools and confines the file tools to the passed
-`--add-dir`, and `Edit`, `Write` and `NotebookEdit` are denied outright.
-`--json-schema` constrains the answer, which comes back already parsed in the
-envelope's `structured_output`.
+`--restricted` drops the shell tools and confines the file tools to the working
+directory and the passed `--add-dir`. The tool set is an allowlist, `--tools Read
+Glob Grep`, because a restricted session otherwise still carries the agent,
+publishing, messaging and web search tools; `--strict-mcp-config` keeps the user's
+MCP connectors out for the same reason. `Edit`, `Write` and `NotebookEdit` are also
+denied outright. `--json-schema` constrains the answer, which comes back already
+parsed in the envelope's `structured_output`.
+
+`-DenyDir` turns each directory into a `Read(//d/<path>/**)` deny rule on
+`--disallowedTools`. The CLI applies a Read rule to every file tool: Read and a
+Grep or Glob aimed inside are refused, and a Grep or Glob over a parent silently
+leaves the directory's contents out, a glob argument pointing inside included, so
+the model never learns what is there. The CLI tests a rule against the path the
+model names and against that path resolved, so case, `..`, a junction inside the
+tree and 8.3 short names do not get around it, and a subagent inherits it. These
+rules have to go on the command line: `--restricted` ignores project and user
+settings files.
+
+The CLI also resolves the working directories, so when the repository is reached
+through a junction or symbolic link, its real path is readable as well as the one
+the script was given, and a rule on the given spelling alone does not cover it. Each
+directory is therefore denied under both spellings, the resolved one taken from
+`GetFinalPathNameByHandle`. A subst drive is not resolved by the CLI, so its real
+path stays outside the working directories. A path the rule syntax would misread
+(`[ ]` is a character class, `{ }` alternation) or a UNC path stops the call with an
+error rather than becoming a rule that matches nothing; spaces, commas and
+parentheses are fine.
+
+`-WorkDir` sets the child's working directory, which `--restricted` also counts as
+readable. The drivers set it to the repository root, so what the model can read no
+longer depends on where the script was started from.
+
+`--no-session-persistence` keeps the CLI from saving each call under
+`~/.claude/projects`, which would be a copy of the auditor's transcript outside
+`scan/runs/`; `--restricted` keeps that directory out of reach anyway.
+
+`--restricted` also skips `CLAUDE.md` discovery. The seam sets
+`CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` on the child, which loads the
+`CLAUDE.md` of each `-AllowDir` directory with its `@` imports: for PoDoFo that is
+`CLAUDE.md` -> `AGENTS.md` -> `CODING-STYLE.md`, which carries rules the audit
+depends on, such as what does not count as a vulnerability. Parent directories stay
+out, and the scanner's own `CLAUDE.md` is not picked up when the validator reads a
+report beside it. `Start-Process -Environment` needs PowerShell 7.4.
 
 The CLI runs as a child process with output redirected to a file rather than piped,
 so the caller can animate progress through `-OnWait` and the log is watchable while
@@ -190,9 +248,12 @@ where it was - pending, or audited when the audit was already saved; every other
 still ends the run loudly.
 
 Swapping in another provider means replacing only this file
-(`-ModelScript <path>`); the contract is `-Prompt -Schema -Label -AllowDir -OnWait
--RunLog -Model -Effort -MaxBudgetUsd`, and raising `PodofoRateLimitReached` for an
-exhausted quota if it wants the same clean stop.
+(`-ModelScript <path>`); the contract is `-Prompt -Schema -Label -AllowDir -DenyDir
+-WorkDir -OnWait -RunLog -Model -Effort -MaxBudgetUsd`, and raising
+`PodofoRateLimitReached` for an exhausted quota if it wants the same clean stop. A
+replacement has to enforce `-DenyDir` itself; nothing else does. It should also give
+the model the `CLAUDE.md` of each `-AllowDir` directory, since the audit relies on
+the rules in it.
 
 Note: the CLI returns thinking blocks with the reasoning stripped. Only the encrypted
 signature survives, and some blocks carry a one- or two-sentence summary in its
@@ -210,13 +271,14 @@ governance/security-audit/
 ├── audit-common.ps1           shared helpers
 ├── model-seam-claude.ps1      Invoke-ModelPrompt for Claude
 ├── .editorconfig              LF, UTF-8, 4-space indent
+├── archive/                   backups, old scans; denied to model (gitignored)
 └── scan/                      all generated output and state     (gitignored)
     ├── podofo-recon-plan.json                 file work list
     ├── podofo-audit-targets.json              audit target registry
     ├── targets/<file-key>/recon.json          phase one output
     ├── targets/<file-key>/<id>.json           audit and validation record
     ├── targets/<file-key>/<slug>-<id>.md      reports, rendered from the record
-    ├── runs/{recon,audit}/*.log               formatted transcripts
+    ├── runs/{recon,audit}/*.log               formatted transcripts (denied to model)
     └── runs/{recon,audit}-monitor.jsonl       raw event stream, current call
 ```
 
@@ -234,5 +296,6 @@ run, not to the source. The reports are the deliverable.
   `[Console]::IsOutputRedirected` and `Clear-Host` behave differently. Parse-check
   with `[System.Management.Automation.Language.Parser]::ParseFile` at minimum.
 - The prompts tell the model not to modify PoDoFo sources, but that instruction is
-  not what enforces it. Keep the `--restricted` and `--disallowedTools` flags.
+  not what enforces it. Keep the `--restricted`, `--tools`, `--strict-mcp-config`,
+  `--disallowedTools` and `--no-session-persistence` flags.
 - Use `.editorconfig`

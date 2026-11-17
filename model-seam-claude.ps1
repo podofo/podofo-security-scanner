@@ -11,7 +11,34 @@ envelope's structured_output field.
 
 Read-only is enforced by the harness, not by asking the prompt nicely:
 --restricted drops Bash, PowerShell and the REPL and confines the file tools to the
-working directories, and Edit/Write/NotebookEdit are denied outright.
+working directories, --tools narrows what is left to Read, Glob and Grep,
+--strict-mcp-config loads no MCP server, and Edit/Write/NotebookEdit are denied
+outright as well.
+
+-DenyDir takes directories out of reach entirely. Each becomes a Read deny rule,
+which the CLI applies to every file tool: Read is refused, Grep and Glob aimed inside
+are refused, and Grep and Glob run over a parent silently leave its contents out, a
+glob argument pointing inside included. The CLI tests a rule against the path the
+model names and against that path resolved, so case, '..' and a junction inside the
+tree do not get around it, and an 8.3 short name is refused as suspicious. It also
+resolves the working directories, so when the repository is reached through a
+junction or symbolic link its real path is readable too; each directory is therefore
+denied under the spelling given and under its resolved one. A path the rule
+syntax would misread ('[ ]' is a character class, '{ }' alternation) or a UNC path is
+refused with an error rather than turned into a rule that matches nothing.
+
+-WorkDir sets the child's working directory, which --restricted also counts as
+readable; left empty, it inherits the caller's. Relative directories are taken
+against the current PowerShell location.
+
+--no-session-persistence keeps the CLI from saving each call under ~/.claude/projects,
+which would be a copy of the auditor's transcript outside scan/runs.
+
+--restricted skips CLAUDE.md discovery, which would leave the model without the
+project's conventions and its rules on what does not count as a vulnerability.
+CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD brings back the CLAUDE.md of each
+-AllowDir directory, @-imports included; parent directories stay out, and a nested
+CLAUDE.md is not picked up when the model reads a file beside it.
 
 The CLI runs as a child process with its output redirected to a file rather than
 piped, so the caller can animate progress through -OnWait while it works. Reading a
@@ -131,6 +158,138 @@ function Get-FailureReason
     return ($parts -join ' | ')
 }
 
+# Relative paths are taken against the current PowerShell location. GetFullPath alone
+# would use the process directory, which Set-Location does not move, and the CLI would
+# resolve a relative --add-dir against the child's working directory. audit-common has
+# the same helper; the seam does not depend on it.
+function Resolve-SeamPath
+{
+    param([Parameter(Mandatory)][string]$Path)
+
+    return [System.IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path))
+}
+
+# GetFinalPathNameByHandle resolves junctions, symbolic links and subst drives in one
+# call, but it needs a handle, and .NET will not open one on a directory.
+if (-not ('PodofoSeam.FinalPath' -as [type]))
+{
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace PodofoSeam
+{
+    public static class FinalPath
+    {
+        const uint FileReadAttributes = 0x80;
+        const uint FileShareAll = 0x7;
+        const uint OpenExisting = 3;
+        const uint FileFlagBackupSemantics = 0x02000000;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security,
+            uint disposition, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint length, uint flags);
+
+        public static string Get(string path)
+        {
+            using (SafeFileHandle handle = CreateFileW(path, FileReadAttributes, FileShareAll, IntPtr.Zero,
+                OpenExisting, FileFlagBackupSemantics, IntPtr.Zero))
+            {
+                if (handle.IsInvalid)
+                    throw new Win32Exception();
+
+                // Too small a buffer returns the size needed, terminator included.
+                var buffer = new StringBuilder(512);
+                uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+                if (length >= buffer.Capacity)
+                {
+                    buffer.Capacity = (int)length + 1;
+                    length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+                }
+
+                if (length == 0)
+                    throw new Win32Exception();
+
+                return buffer.ToString();
+            }
+        }
+    }
+}
+'@
+}
+
+# The directory as the file system resolves it, in drive-letter form, or a UNC path
+# for a network drive. One not created yet resolves through its nearest existing
+# parent, so archive/ is covered before it exists.
+function Get-FinalPath
+{
+    param([Parameter(Mandatory)][string]$Path)
+
+    $existing = $Path
+    $rest = [System.Collections.Generic.List[string]]::new()
+    while (-not [System.IO.Directory]::Exists($existing))
+    {
+        $parent = [System.IO.Path]::GetDirectoryName($existing)
+        if ([string]::IsNullOrEmpty($parent))
+            { return $Path }
+
+        $rest.Insert(0, [System.IO.Path]::GetFileName($existing))
+        $existing = $parent
+    }
+
+    $final = [PodofoSeam.FinalPath]::Get($existing)
+    if ($final.StartsWith('\\?\UNC\'))
+        { $final = '\\' + $final.Substring(8) }
+    elseif ($final.StartsWith('\\?\'))
+        { $final = $final.Substring(4) }
+
+    return [System.IO.Path]::Combine([string[]](@($final) + $rest))
+}
+
+# Permission rules take an absolute path as //<path>, with a Windows drive turned into
+# a leading segment: D:\Staging\x -> Read(//d/Staging/x/**).
+#
+# The CLI resolves the working directories, so through a junction or symbolic link
+# the directory is readable under its real path as well as the one given, and a rule
+# on the given spelling alone does not cover the real one. Returns a rule for each
+# spelling.
+function ConvertTo-ReadDenyRule
+{
+    param([Parameter(Mandatory)][string]$Directory)
+
+    # Trimmed only once resolved: 'D:' without its separator means the current
+    # directory on D:, not the drive root. The resolved spelling also carries the
+    # on-disk case, so it is the one kept when the two differ in case alone.
+    $given = (Resolve-SeamPath $Directory)
+    $final = (Get-FinalPath -Path $given).TrimEnd('\', '/')
+    $given = $given.TrimEnd('\', '/')
+    $spellings = @($final)
+    if ($given -ne $final)
+        { $spellings += $given }
+
+    foreach ($spelling in $spellings)
+    {
+        # A rule that silently matches nothing would leave the directory readable, so
+        # a path the rule cannot express stops the call instead: '[ ]' reads as a
+        # character class and '{ }' as alternation, and the rule form for a UNC path
+        # has not been established.
+        if (($spelling -match '[\[\]{}]') -or $spelling.StartsWith('\\'))
+            { throw "Cannot deny '$spelling' to the model: a permission rule cannot express this path." }
+
+        $path = $spelling -replace '\\', '/'
+        if ($path -match '^(?<drive>[A-Za-z]):(?<rest>.*)$')
+            { $path = '/' + $Matches['drive'].ToLowerInvariant() + $Matches['rest'] }
+
+        "Read(/$path/**)"
+    }
+}
+
 function Invoke-ModelPrompt
 {
     param(
@@ -138,6 +297,8 @@ function Invoke-ModelPrompt
         [hashtable]$Schema,
         [string]$Label,
         [string[]]$AllowDir,
+        [string[]]$DenyDir,
+        [string]$WorkDir,
         [scriptblock]$OnWait,
         [string]$RunLog,
         [string]$Model = 'claude-opus-5-5[1m]',
@@ -165,6 +326,12 @@ function Invoke-ModelPrompt
                 { New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null }
         }
 
+        # The tool set is an allowlist. A restricted session still carries the agent,
+        # publishing, messaging and web search tools and the user's MCP connectors,
+        # several of which send content off the machine. Edit, Write and NotebookEdit
+        # are outside the list already; the explicit deny stays as a second line.
+        # --no-session-persistence: a saved session would be a copy of the auditor's
+        # transcript outside scan/runs.
         $arguments = @(
             '-p'
             '--output-format', 'stream-json'
@@ -172,21 +339,40 @@ function Invoke-ModelPrompt
             '--model', $Model
             '--effort', $Effort
             '--restricted'
+            '--no-session-persistence'
+            '--strict-mcp-config'
+            '--tools', 'Read', 'Glob', 'Grep'
             '--disallowedTools', 'Edit', 'Write', 'NotebookEdit'
-            '--max-budget-usd', $MaxBudgetUsd
         )
 
+        # The flag takes a list, so the deny rules have to follow it directly.
+        foreach ($dir in $DenyDir)
+            { $arguments += ConvertTo-ReadDenyRule -Directory $dir }
+
+        $arguments += @('--max-budget-usd', $MaxBudgetUsd)
+
         foreach ($dir in $AllowDir)
-            { $arguments += @('--add-dir', $dir) }
+            { $arguments += @('--add-dir', (Resolve-SeamPath $dir)) }
 
         if ($null -ne $Schema)
             { $arguments += @('--json-schema', ($Schema | ConvertTo-Json -Depth 12 -Compress)) }
 
         $commandLine = @($arguments | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) })
 
-        $process = Start-Process -FilePath 'claude' -ArgumentList $commandLine `
-            -RedirectStandardInput $promptFile -RedirectStandardOutput $outFile `
-            -RedirectStandardError $errFile -NoNewWindow -PassThru
+        $start = @{
+            FilePath               = 'claude'
+            ArgumentList           = $commandLine
+            RedirectStandardInput  = $promptFile
+            RedirectStandardOutput = $outFile
+            RedirectStandardError  = $errFile
+            Environment            = @{ CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD = '1' }
+            NoNewWindow            = $true
+            PassThru               = $true
+        }
+        if (-not [string]::IsNullOrEmpty($WorkDir))
+            { $start.WorkingDirectory = Resolve-SeamPath $WorkDir }
+
+        $process = Start-Process @start
 
         while (-not $process.HasExited)
         {
