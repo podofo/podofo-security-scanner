@@ -13,6 +13,10 @@ schema-constrained JSON; the scripts own every file that gets written.
 Everything here is PowerShell 7, `Set-StrictMode -Version Latest`,
 `$ErrorActionPreference = 'stop'`.
 
+## Credits
+
+The PoDoFo scanner drew significant inspiration from the work of Salvatore Sanfilippo (aka [antirez](https://bsky.app/profile/antirez.bsky.social)), who described in detail the security scanning [harness](https://www.youtube.com/watch?v=opouuT344OE) he implemented for [Redis](https://github.com/redis/redis).
+
 ## The two scripts
 
 ### `podofo-recon-plan.ps1` - phase one, reconnaissance
