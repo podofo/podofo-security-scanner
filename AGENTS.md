@@ -13,6 +13,12 @@ schema-constrained JSON; the scripts own every file that gets written.
 Everything here is PowerShell 7, `Set-StrictMode -Version Latest`,
 `$ErrorActionPreference = 'stop'`.
 
+> [!WARNING]
+> The quality of the results depends on the model. Use one that is strong at
+> vulnerability discovery: a weaker model produces fewer real findings and more noise.
+> The scans of PoDoFo were run with Claude Fable 5.1 (`claude-fable-5-1`, the
+> `-Model` default).
+
 ## Credits
 
 The PoDoFo scanner drew significant inspiration from the work of Salvatore Sanfilippo (aka [antirez](https://bsky.app/profile/antirez.bsky.social)), who described in detail the security scanning [harness](https://www.youtube.com/watch?v=opouuT344OE) he implemented for [Redis](https://github.com/redis/redis).
